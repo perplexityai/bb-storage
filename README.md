@@ -218,3 +218,26 @@ Buildbarn.
 # Commercial Support & Hosting
 
 Via our [partners](https://github.com/buildbarn#commercial-support) commercial support & hosting can be procured.
+
+## CAS upload size limit
+
+Set `maximumCasBlobSizeBytes` to a positive number to limit the
+uncompressed size of an individual CAS upload. The default, zero, leaves
+uploads unlimited. Negative values fail startup.
+
+The limit applies to identity and Zstd ByteStream writes and to individual
+`BatchUpdateBlobs` entries. Oversized uploads return `INVALID_ARGUMENT`
+before decoder acquisition or storage access. Batch entries within the
+limit can still succeed. Existing larger blobs remain readable.
+
+The server advertises `CacheCapabilities.max_cas_blob_size_bytes`, retaining
+a smaller backend limit when present. CAS clients preserve this capability
+when forwarding it. Keep storage shard policies consistent; sharding obtains
+capabilities from one shard per query.
+
+This is a per-blob upload policy, not a total request-size, memory, or
+concurrency limit. Batch requests and the first ByteStream message have
+already been received when the digest size is checked; keep gRPC message
+limits as well. Compressed BatchUpdateBlobs is not enabled by this option.
+Verify that clients skip oversized cache entries without failing local
+builds or publishing incomplete Action Cache entries before enabling it.

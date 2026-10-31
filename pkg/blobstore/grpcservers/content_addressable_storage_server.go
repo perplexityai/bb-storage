@@ -16,15 +16,27 @@ import (
 type contentAddressableStorageServer struct {
 	contentAddressableStorage blobstore.BlobAccess
 	maximumMessageSizeBytes   int64
+	maximumBlobSizeBytes      int64
 }
 
 // NewContentAddressableStorageServer creates a GRPC service for serving
 // the contents of a Bazel Content Addressable Storage (CAS) to Bazel.
 func NewContentAddressableStorageServer(contentAddressableStorage blobstore.BlobAccess, maximumMessageSizeBytes int64) remoteexecution.ContentAddressableStorageServer {
+	server, _ := NewContentAddressableStorageServerWithMaximumBlobSize(contentAddressableStorage, maximumMessageSizeBytes, 0)
+	return server
+}
+
+// NewContentAddressableStorageServerWithMaximumBlobSize limits the logical
+// size of individual uploads. Zero disables the limit; reads are unaffected.
+func NewContentAddressableStorageServerWithMaximumBlobSize(contentAddressableStorage blobstore.BlobAccess, maximumMessageSizeBytes, maximumBlobSizeBytes int64) (remoteexecution.ContentAddressableStorageServer, error) {
+	if maximumBlobSizeBytes < 0 {
+		return nil, status.Error(codes.InvalidArgument, "Maximum CAS blob size cannot be negative")
+	}
 	return &contentAddressableStorageServer{
+		maximumBlobSizeBytes:      maximumBlobSizeBytes,
 		contentAddressableStorage: contentAddressableStorage,
 		maximumMessageSizeBytes:   maximumMessageSizeBytes,
-	}
+	}, nil
 }
 
 func (s *contentAddressableStorageServer) FindMissingBlobs(ctx context.Context, in *remoteexecution.FindMissingBlobsRequest) (*remoteexecution.FindMissingBlobsResponse, error) {
@@ -130,6 +142,9 @@ func (s *contentAddressableStorageServer) BatchUpdateBlobs(ctx context.Context, 
 	}
 	for _, request := range in.Requests {
 		digest, err := digestFunction.NewDigestFromProto(request.Digest)
+		if err == nil {
+			err = checkCASUploadSize(digest, s.maximumBlobSizeBytes)
+		}
 		if err == nil {
 			err = s.contentAddressableStorage.Put(
 				ctx,

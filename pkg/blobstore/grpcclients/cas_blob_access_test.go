@@ -337,6 +337,7 @@ func TestCASBlobAccessGetCapabilities(t *testing.T) {
 		).DoAndReturn(func(ctx context.Context, method string, args, reply interface{}, opts ...grpc.CallOption) error {
 			proto.Merge(reply.(proto.Message), &remoteexecution.ServerCapabilities{
 				CacheCapabilities: &remoteexecution.CacheCapabilities{
+					MaxCasBlobSizeBytes: 1234,
 					DigestFunctions: []remoteexecution.DigestFunction_Value{
 						remoteexecution.DigestFunction_SHA256,
 						remoteexecution.DigestFunction_VSO,
@@ -366,6 +367,7 @@ func TestCASBlobAccessGetCapabilities(t *testing.T) {
 		require.NoError(t, err)
 		testutil.RequireEqualProto(t, &remoteexecution.ServerCapabilities{
 			CacheCapabilities: &remoteexecution.CacheCapabilities{
+				MaxCasBlobSizeBytes: 1234,
 				DigestFunctions: []remoteexecution.DigestFunction_Value{
 					remoteexecution.DigestFunction_SHA256,
 				},
