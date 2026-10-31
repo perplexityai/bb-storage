@@ -32,6 +32,7 @@ go_library(
 go_test(
     name = "grpcservers_test",
     srcs = [
+        "byte_stream_admission_test.go",
         "byte_stream_server_test.go",
         "content_addressable_storage_server_test.go",
         "indirect_content_addressable_storage_server_test.go",
@@ -39,6 +40,7 @@ go_test(
     deps = [
         ":grpcservers",
         "//internal/mock",
+        "//pkg/blobstore",
         "//pkg/blobstore/buffer",
         "//pkg/digest",
         "//pkg/proto/icas",

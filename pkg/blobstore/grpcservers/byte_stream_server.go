@@ -68,15 +68,18 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 		}
 
 	case remoteexecution.Compressor_ZSTD:
-		b := s.blobAccess.Get(ctx, digest)
+		// A remote BlobAccess may start an RPC and retain buffers immediately.
+		// Do not consume backend resources while waiting for encoder capacity.
 		encoder, err := s.zstdPool.NewEncoder(ctx, &readStreamWriter{out: out})
 		if err != nil {
-			b.Discard()
+			if code := status.Code(err); code == codes.Canceled || code == codes.DeadlineExceeded {
+				return util.StatusWrap(err, "Failed to acquire ZSTD encoder")
+			}
 			return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD encoder: %v", err)
 		}
 		defer encoder.Close()
 
-		r := b.ToChunkReader(in.ReadOffset, s.readChunkSize)
+		r := s.blobAccess.Get(ctx, digest).ToChunkReader(in.ReadOffset, s.readChunkSize)
 		defer r.Close()
 		for {
 			chunk, err := r.Read()
