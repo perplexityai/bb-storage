@@ -15,6 +15,12 @@ func newChunkReaderBackedReader(r ChunkReader) io.ReadCloser {
 	}
 }
 
+// NewReaderFromChunkReader adapts a chunk stream without buffering the blob.
+// Closing the returned reader closes the chunk stream.
+func NewReaderFromChunkReader(r ChunkReader) io.ReadCloser {
+	return newChunkReaderBackedReader(r)
+}
+
 func (r *chunkReaderBackedReader) Read(p []byte) (int, error) {
 	nTotal := copy(p, r.lastChunk)
 	p = p[nTotal:]

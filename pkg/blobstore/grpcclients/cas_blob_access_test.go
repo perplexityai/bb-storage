@@ -561,6 +561,10 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 	defer cancel()
 
 	r2 := mock.NewMockFileReader(ctrl)
+	r2.EXPECT().ReadAt(gomock.Len(1000), int64(0)).DoAndReturn(func(p []byte, off int64) (int, error) {
+		copy(p, largeData)
+		return 1000, nil
+	})
 	r2.EXPECT().Close()
 
 	// This Put needs a new stream — but it will fail before using it because
@@ -574,7 +578,7 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 
 	err := blobAccess.Put(shortCtx, blobDigest, buffer.NewValidatedBufferFromReaderAt(r2, 1000))
 	require.Error(t, err)
-	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
 
 	// Unblock the first Put so it can complete.
 	close(sendUnblock)

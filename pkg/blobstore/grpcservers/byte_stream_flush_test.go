@@ -72,6 +72,6 @@ func TestByteStreamCompressedReadPreservesBackendFailure(t *testing.T) {
 	server := grpcservers.NewByteStreamServer(backend, 64, pool)
 	stream := &failedFlushReadStream{ctx: t.Context()}
 	err := server.Read(&bytestream.ReadRequest{ResourceName: "compressed-blobs/zstd/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824/5"}, stream)
-	require.Positive(t, stream.sends, "force a second failure during encoder cleanup")
+	require.Zero(t, stream.sends, "failed input must not be encoded")
 	require.Equal(t, codes.DataLoss, status.Code(err), "flush failure must not replace the backend error")
 }

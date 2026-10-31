@@ -608,6 +608,26 @@ message LocalBlobAccessConfiguration {
   // level, e.g., on top of CompletenessCheckingBlobAccess. This can be
   // achieved by using HierarchicalInstanceNamesBlobAccess.
   bool hierarchical_instance_names = 14;
+
+  // When configured for block-device CAS storage, new blobs use compressed
+  // primary records. Legacy raw records remain readable. Whole compressed
+  // reads can be forwarded without codecs. Existing uncompressed readers
+  // cannot read the new records, so rolling back requires a compatible reader.
+  // Encoded checksum validation is always enabled; the block device's
+  // data_integrity_validation_cache is not applied in this mode.
+  CASCompression cas_compression = 16;
+
+  message CASCompression {
+    // Existing disk-backed directory supporting unlink of open temporary files.
+    // Do not place this on a memory-backed filesystem.
+    string staging_directory = 1;
+    // Bounds reserved temporary disk bytes across active uploads, including
+    // worst-case encoded expansion and index overhead. Required and positive.
+    int64 maximum_staged_bytes = 2;
+    // Independent bound on active compression/staging requests. Excess work
+    // is rejected before receiving any blob bytes. Required and positive.
+    int64 maximum_concurrent_writes = 3;
+  }
 }
 
 message ExistenceCachingBlobAccessConfiguration {

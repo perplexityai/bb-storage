@@ -81,9 +81,27 @@ func (frames *frameList) UnmarshalJSON(data []byte) error {
 // object open until all reads finish. Concurrent reads are supported when the
 // underlying ReaderAt supports them, as os.File does.
 type Reader struct {
-	source io.ReaderAt
-	digest digest.Digest
-	index  index
+	source   io.ReaderAt
+	digest   digest.Digest
+	index    index
+	metadata []byte
+	footer   [footerSize]byte
+}
+
+// MaximumStoredSize bounds staging space before an upload starts. The index
+// budget is reserved independently of compression ratio.
+func MaximumStoredSize(size int64, frameSize int) (int64, error) {
+	if size < 0 || frameSize < minimumFrameSize || frameSize > maximumFrameSize {
+		return 0, status.Error(codes.InvalidArgument, "Invalid logical size or frame size")
+	}
+	count := int64(1)
+	if size > 0 {
+		count += (size - 1) / int64(frameSize)
+	}
+	if count > maximumFrames {
+		return 0, status.Error(codes.ResourceExhausted, "Blob requires too many frames")
+	}
+	return count*encodedLimit(frameSize) + maximumIndexSize + footerSize, nil
 }
 
 func encodedLimit(frameSize int) int64 {
@@ -325,7 +343,19 @@ func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, erro
 	if remaining != 0 || offset != end {
 		return bad()
 	}
-	return &Reader{source: source, digest: expected, index: idx}, nil
+	return &Reader{source: source, digest: expected, index: idx, metadata: metadata, footer: footer}, nil
+}
+
+// WriteRepresentation copies the complete stored representation while verifying
+// frame checksums. Block refreshes use this to retain the compressed encoding.
+func (r *Reader) WriteRepresentation(ctx context.Context, dst io.Writer) error {
+	if err := r.WriteCompressed(ctx, dst); err != nil {
+		return err
+	}
+	if err := writeWithContext(ctx, dst, r.metadata); err != nil {
+		return err
+	}
+	return writeWithContext(ctx, dst, r.footer[:])
 }
 
 // FrameDigests returns a copy of the ordered logical chunk mapping. The

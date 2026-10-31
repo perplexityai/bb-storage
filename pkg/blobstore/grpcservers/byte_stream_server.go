@@ -46,7 +46,7 @@ func NewByteStreamServerWithMaximumBlobSize(blobAccess blobstore.BlobAccess, rea
 	}, nil
 }
 
-func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteStream_ReadServer) (returnErr error) {
+func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteStream_ReadServer) error {
 	digest, compressor, err := digest.NewDigestFromByteStreamReadPath(in.ResourceName)
 	if err != nil {
 		return err
@@ -80,39 +80,30 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 		}
 
 	case remoteexecution.Compressor_ZSTD:
-		// A compressed backend read acquires a decoder. Keep the same
-		// decoder-before-encoder order as writes when sharing a bounded pool.
+		// Full reads can retain the backend encoding. Offset and retrying
+		// reads must instead operate in logical byte space.
 		b := s.blobAccess.Get(ctx, digest)
-		encoder, err := s.zstdPool.NewEncoder(ctx, &readStreamWriter{out: out})
-		if err != nil {
-			b.Discard()
-			if code := status.Code(err); code == codes.Canceled || code == codes.DeadlineExceeded {
-				return util.StatusWrap(err, "Failed to acquire ZSTD encoder")
+		if in.ReadOffset == 0 {
+			if r, ok := buffer.ZSTDChunkReader(b, s.readChunkSize); ok {
+				defer r.Close()
+				for {
+					p, err := r.Read()
+					if err == io.EOF {
+						return nil
+					}
+					if err != nil {
+						return err
+					}
+					if err := out.Send(&bytestream.ReadResponse{Data: p}); err != nil {
+						return err
+					}
+				}
 			}
-			return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD encoder: %v", err)
 		}
-		defer func() {
-			// Closing flushes the final compressed bytes to the client.
-			// Preserve an earlier read/write failure if cleanup also fails.
-			if err := encoder.Close(); returnErr == nil {
-				returnErr = err
-			}
-		}()
-
-		r := b.ToChunkReader(in.ReadOffset, s.readChunkSize)
+		r := buffer.NewReaderFromChunkReader(b.ToChunkReader(in.ReadOffset, s.readChunkSize))
 		defer r.Close()
-		for {
-			chunk, err := r.Read()
-			if err == io.EOF {
-				return nil
-			}
-			if err != nil {
-				return err
-			}
-			if _, err := encoder.Write(chunk); err != nil {
-				return err
-			}
-		}
+		return bb_zstd.Copy(ctx, s.zstdPool, &readStreamWriter{out: out}, r)
+
 	default:
 		return status.Errorf(codes.Unimplemented, "This service does not support downloading compression type: %s", compressor)
 	}

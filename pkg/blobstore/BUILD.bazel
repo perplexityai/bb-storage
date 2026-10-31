@@ -9,6 +9,7 @@ go_library(
         "authorizing_blob_access.go",
         "blob_access.go",
         "cas_read_buffer_factory.go",
+        "compressed_cas_blob_access.go",
         "deadline_enforcing_blob_access.go",
         "demultiplexing_blob_access.go",
         "empty_blob_injecting_blob_access.go",
@@ -33,6 +34,7 @@ go_library(
         "//pkg/auth",
         "//pkg/blobstore/buffer",
         "//pkg/blobstore/slicing",
+        "//pkg/blobstore/zstdframes",
         "//pkg/capabilities",
         "//pkg/clock",
         "//pkg/cloud/aws",
@@ -53,6 +55,7 @@ go_library(
         "@org_golang_google_protobuf//encoding/protowire",
         "@org_golang_google_protobuf//proto",
         "@org_golang_google_protobuf//types/known/timestamppb",
+        "@org_golang_x_sync//semaphore",
     ],
 )
 

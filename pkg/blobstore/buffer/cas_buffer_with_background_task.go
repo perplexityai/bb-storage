@@ -47,8 +47,10 @@ func newCASBufferWithBackgroundTask(base Buffer, digest digest.Digest, source So
 
 func (b *casBufferWithBackgroundTask) decorateBuffer(replacement Buffer) Buffer {
 	return &casBufferWithBackgroundTask{
-		base: replacement,
-		task: b.task,
+		base:   replacement,
+		digest: b.digest,
+		source: b.source,
+		task:   b.task,
 	}
 }
 

@@ -204,7 +204,7 @@ func (ba *hierarchicalCASBlobAccess) Get(ctx context.Context, blobDigest digest.
 	// has finished to apply back-pressure.
 	b1, b2 := b.CloneStream()
 	return b1.WithTask(func() error {
-		putFinalizer := putWriter(b2)
+		putFinalizer := putWriter(buffer.ForLocalRefresh(b2))
 		ba.lock.Lock()
 		err := ba.finalizePut(putFinalizer, canonicalKey, lookupKey)
 		ba.lock.Unlock()
@@ -379,7 +379,7 @@ func (ba *hierarchicalCASBlobAccess) FindMissing(ctx context.Context, digests di
 				// Copy the data while unlocked, so that
 				// concurrent requests for other data
 				// continue to be serviced.
-				putFinalizer := putWriter(b)
+				putFinalizer := putWriter(buffer.ForLocalRefresh(b))
 
 				ba.lock.Lock()
 				if err := ba.finalizePut(putFinalizer, canonicalKey, lookupKey); err != nil {

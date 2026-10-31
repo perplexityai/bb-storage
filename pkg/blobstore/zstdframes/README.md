@@ -1,64 +1,124 @@
-# Indexed Zstandard representation experiment
+# Compressed primary CAS storage
 
-This package is an isolated storage-format experiment, not an enabled CAS backend.
-It tests whether a logical blob can remain compressed on disk and across transport hops while supporting independent parallel frame reads.
-No server configuration, existing storage format, or capability advertisement changes.
+Local block-device CAS storage can retain validated Zstandard representations as
+its primary records. Full compressed ByteStream reads forward the stored frame
+bytes through storage and frontend servers without acquiring encoders or decoders.
+The logical CAS digest remains the hash and size of the uncompressed bytes.
 
 ```text
-logical CAS digest (hash and size of uncompressed bytes)
-  -> independently encoded Zstandard frames
-  -> bounded index with ordered logical digests and encoded checksums
-  -> versioned commit footer
+upload -> validate logical bytes -> stage frames + index -> publish local record
+local compressed record -> storage ByteStream -> frontend ByteStream -> client
+                           same compressed frames throughout the full read
 ```
 
-`Encode` verifies the complete logical digest before writing the index and footer.
-The caller must use a temporary object, discard it on error, and publish it atomically only after successful completion and any required durability operations.
-Cancellation or a destination error can occur after the footer bytes have been written; a readable temporary object is not a substitute for a successful `Encode` result.
-The package neither owns files nor implements publication, eviction, disk quotas, or concurrent fill admission.
+## Configuration and storage ownership
 
-`Open` validates the index against the expected logical digest.
-`ReadCompressedFrame` verifies an encoded checksum before returning any bytes from that frame.
-`WriteCompressed` concatenates the verified frames without acquiring an encoder or decoder.
-`WriteIdentity` decodes only frames overlapping a logical suffix, validates each logical chunk, and releases its decoder before writing to a potentially slow consumer.
-Backing objects must remain immutable and readable until all readers finish.
+Set `local.casCompression` on a block-device CAS backend:
 
-Checksums detect accidental corruption; they do not authenticate an arbitrary uploaded index.
-Only locally generated representations from successful `Encode` calls may be published.
-Client-supplied indexes must never bypass logical content validation.
-An index associates logical chunks with compressed checksums based on that validation; compressed reads do not repeat logical validation by decoding.
+```json
+{
+  "casCompression": {
+    "stagingDirectory": "/var/lib/buildbarn/staging",
+    "maximumStagedBytes": "1073741824",
+    "maximumConcurrentWrites": "8"
+  }
+}
+```
 
-The configured logical frame size ranges from 4 KiB to 4 MiB; the last frame may be smaller, and an empty blob has one valid empty Zstandard frame.
-There are at most 65,536 frames and a 32 MiB serialized index.
-Encoded frame size is bounded separately, and the index parser bounds entry count before materializing the complete array.
-The entire logical blob is never buffered.
-These are format resource bounds, not the configurable CAS upload policy.
-Readers and writers retain ownership of their I/O handles and must interrupt blocked I/O when their context is canceled.
+The directory must already exist on a disk filesystem that supports unlinking an
+open file. Avoid memory-backed filesystems. This is a fragment of the local
+backend configuration, not a complete server configuration. In-memory blocks and
+non-CAS storage do not support this option. Absent configuration retains raw
+storage. To forward compressed reads across a frontend's internal gRPC hop, also
+set that backend's `grpc.enableCompression` and advertise `ZSTD` at the servers.
 
-## What the tests establish
+Before consuming an upload, the storage wrapper reserves one write slot and a
+conservative bound on staging bytes: worst-case encoded frame expansion plus a
+32 MiB index allowance. Excess work fails with `RESOURCE_EXHAUSTED`. An unlinked
+temporary file receives the representation; errors, cancellation, and process
+exit reclaim it. Validation must finish successfully before the existing local
+allocator publishes the record. The allocator, key-location map, persistence,
+eviction, and reader references remain responsible for the primary store.
+Allocation and local refresh use the physical record length; keys and API sizes
+remain logical. Refresh preserves the compressed representation without codecs.
+Ordinary copies into another backend use logical bytes and its own storage format.
 
-- Reopened file-backed representations support compressed reads and concurrent independent frame reads.
-- Concatenated stored frames decode to the original bytes and digest using the existing Go Zstandard implementation.
-- Read-only gRPC fixtures forward the exact stored bytes across two hops; parallel chunk requests reconstruct the logical blob.
-- Identity reads handle offsets without decoding earlier frames.
-- Truncated, oversized, or incorrectly hashed uploads never produce a readable completed representation.
-- Corrupt frames are rejected before their bytes are returned; invalid index lengths, ranges, counts, and digests are rejected.
-- Cancellation and source, destination, and transport errors propagate.
-- Errors returned alongside final source bytes remain errors; full `ReaderAt` reads may return `EOF` without failing the transfer.
-- Separate fuzz targets exercise raw representations and mutated index metadata with recomputed checksums, so index parsing is not hidden behind the checksum gate.
+New records use independent 1 MiB logical frames, followed by a bounded index and
+versioned footer. This is the primary copy, not a second read cache. Uploads are
+validated and encoded at storage; arbitrary client-supplied encoded indexes are
+never accepted. Compressed upload hops may still decode and re-encode. The
+zero-codec path applies to full compressed **reads**.
 
-The transport fixtures are deliberately separate from the production server.
-They do not establish that its authorization, replication, retry, admission, or metrics decorators preserve this representation.
-They also do not establish compatibility with every Bazel or remote-execution worker decoder.
+## Compatibility and fallback behavior
 
-## Integration gates
+- Existing raw records remain readable and receive normal logical validation.
+- Full compressed reads verify each stored frame's encoded checksum before
+  exposing its bytes. Trusted backend streams retain their encoded representation
+  at the frontend; the final client must validate the logical digest.
+- Identity reads and compressed reads with a nonzero logical offset decode as
+  needed. Fallback encoding produces bounded independent frames and releases the
+  encoder before reading more input, including retry input. This avoids holding an
+  encoder while a shared bounded pool is needed for a decoder.
+- Authorization, metrics, and shard error annotation remain in the request path.
+  Retrying decorators use the logical fallback: compressed byte offsets are not
+  safely interchangeable between different encodings of the same blob.
+- Block-device integrity-cache shortcuts are disabled in compressed mode. Encoded
+  checksums and legacy logical validation remain enabled.
+- Existing REAPI digest and ByteStream APIs are unchanged. No chunk-discovery or
+  content-defined-chunking capability is advertised. Independent frame reads in
+  this package are not a protocol for clients to discover parallel downloads.
 
-1. Choose the persistent representation owner and implement atomic publication, disk accounting, bounded single-flight fills, and eviction while readers are active.
-2. Carry encoded representations through the existing storage and frontend paths without bypassing authorization or acquiring codecs on full compressed reads.
-   Preserve decoder-before-encoder acquisition on fallbacks, cancellation, final-send failures, and retry semantics.
-3. Expose ordered chunk mappings and independently addressable chunks using the supported remote-execution protocol, with coherent retention and missing-chunk recovery.
-   Fixed-size frames here are not an implementation of FastCDC or RepMaxCDC and must not be advertised as either algorithm.
-4. Verify actual Bazel and worker clients, identity and compressed offsets, corruption, shard loss, mixed reads/writes, and bounded failure recovery.
-5. Compare CPU, memory, disk footprint, network traffic, and latency under equivalent workloads before selecting the format for rollout.
+This is a storage-format rollout. **Older raw-only readers cannot read compressed
+records.** Keep a compatible reader and `casCompression` configured after enabling
+writes, or retire the affected cache data before reverting to an older binary.
+Disabling the option is not a safe rollback of a populated compressed store.
+Changing shard configuration or deploying this code is a separate operator action.
 
-This experimental format may change before integration.
-Existing uncompressed files must not be reinterpreted as this format, and no migration is part of this change.
+## Format integrity and bounds
+
+`Encode` validates the complete logical digest before committing the index/footer.
+Its caller must publish only after successful completion; a readable temporary
+object alone does not establish success after cancellation or an I/O error.
+`Open` checks the index against the expected logical digest. Checksums detect
+accidental corruption, not hostile replacement of both content and metadata.
+Only representations produced by successful local validation may be published.
+
+The format supports logical frame sizes from 4 KiB to 4 MiB, at most 65,536 frames,
+and a serialized index of at most 32 MiB. An empty blob has one valid empty frame.
+Encoded size and parser entry counts are bounded independently. The whole logical
+blob is never buffered. With the integrated 1 MiB frame size, the format supports
+up to 64 GiB per logical blob; the separate CAS upload policy can impose a lower
+limit. Incompressible and tiny records may occupy more space than raw data.
+
+`Reader` supports concurrent frame reads when its immutable backing `ReaderAt`
+does. Its owner must keep that backing object alive through all readers. The local
+buffer implementation pins block references across clones and refreshes.
+
+## Verification
+
+`//pkg/blobstore/compressionintegration:compressionintegration_test` runs the real
+configuration builder, file-backed local store, CAS client, ByteStream handlers,
+authorization, metrics, and sharding over in-process gRPC connections. It checks:
+
+- A logical blob larger than a block fits through compressed physical allocation.
+- Full compressed reads return exactly the stored frames with zero codec leases.
+- Flat and hierarchical block refreshes preserve those bytes and avoid codecs.
+- Identity and offset reads reconstruct the expected bytes.
+- Denied instances, corrupt frames/indexes, and invalid uploads fail correctly.
+- Retrying a disconnected source resumes at the logical offset with another
+  compressed encoding, without holding the encoder during source replacement.
+- Failed uploads release staging resources; copying to raw storage stays logical.
+
+Format tests additionally cover reopened files, concurrent frame reads, malformed
+metadata, truncation, cancellation, and source/destination errors. Mixed compressed
+read/write and copy regressions use a shared one-encoder/one-decoder pool.
+These tests establish correctness in the exercised paths, not throughput under a
+particular deployment's workload. Load comparison and worker-specific end-to-end
+validation are still needed before broad rollout.
+
+A separate local smoke test with Bazel 9.3.1 and two `bb_storage` processes
+uploaded a 5.1 MB artifact and obtained a correct remote-cache hit. Server metrics
+confirmed `ByteStream.Read` with no `BatchReadBlobs` call; the artifact exceeded
+the configured 4 MiB batch size. The same probe rejected an oversized cache
+upload without failing the local build or publishing an incomplete Action Cache
+entry. This does not establish compatibility with every remote-execution worker.
