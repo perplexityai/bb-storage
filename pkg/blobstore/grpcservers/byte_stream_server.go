@@ -68,10 +68,15 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 		}
 
 	case remoteexecution.Compressor_ZSTD:
+		// A compressed backend read acquires a decoder. Keep the same
+		// decoder-before-encoder order as writes when sharing a bounded pool.
 		b := s.blobAccess.Get(ctx, digest)
 		encoder, err := s.zstdPool.NewEncoder(ctx, &readStreamWriter{out: out})
 		if err != nil {
 			b.Discard()
+			if code := status.Code(err); code == codes.Canceled || code == codes.DeadlineExceeded {
+				return util.StatusWrap(err, "Failed to acquire ZSTD encoder")
+			}
 			return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD encoder: %v", err)
 		}
 		defer encoder.Close()
