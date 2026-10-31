@@ -46,7 +46,7 @@ func NewByteStreamServerWithMaximumBlobSize(blobAccess blobstore.BlobAccess, rea
 	}, nil
 }
 
-func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteStream_ReadServer) error {
+func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteStream_ReadServer) (returnErr error) {
 	digest, compressor, err := digest.NewDigestFromByteStreamReadPath(in.ResourceName)
 	if err != nil {
 		return err
@@ -91,7 +91,13 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 			}
 			return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD encoder: %v", err)
 		}
-		defer encoder.Close()
+		defer func() {
+			// Closing flushes the final compressed bytes to the client.
+			// Preserve an earlier read/write failure if cleanup also fails.
+			if err := encoder.Close(); returnErr == nil {
+				returnErr = err
+			}
+		}()
 
 		r := b.ToChunkReader(in.ReadOffset, s.readChunkSize)
 		defer r.Close()
