@@ -38,6 +38,7 @@ go_test(
         "admission_controlled_byte_stream_server_test.go",
         "byte_stream_admission_test.go",
         "byte_stream_codec_order_test.go",
+        "byte_stream_flush_test.go",
         "byte_stream_server_test.go",
         "content_addressable_storage_server_test.go",
         "indirect_content_addressable_storage_server_test.go",
