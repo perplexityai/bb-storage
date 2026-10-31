@@ -169,6 +169,46 @@ Prebuilt container images may be found on [the GitHub Packages page](https://git
 More examples of how the Buildbarn storage daemon may be deployed can be
 found in [the Buildbarn deployments repository](https://github.com/buildbarn/bb-deployments).
 
+## ByteStream admission limits
+
+The optional `byteStreamAdmission` configuration bounds active reads and
+writes independently across all gRPC listeners in a process. For example:
+
+```jsonnet
+{
+  byteStreamAdmission: {
+    maximumConcurrentReads: 16,
+    maximumConcurrentWrites: 8,
+  },
+}
+```
+
+These values are illustrative; choose limits using the workload's CPU,
+memory, network and client-recovery measurements. Omitting the configuration,
+or setting a method's limit to zero, leaves that method unlimited. Negative
+values are rejected at startup.
+
+Excess requests fail immediately with `RESOURCE_EXHAUSTED`, without waiting
+for a slot or starting backend/codec work. A slot remains occupied while a
+request waits on storage, codecs or a slow client. Writes reserve a slot
+before receiving their first message. Completion, errors and cancellation
+release the slot. This admission layer does not change codec acquisition
+order, including when compressed backend transfers share the codec pool.
+
+`buildbarn_bytestream_admission_active_requests` and
+`buildbarn_bytestream_admission_rejected_requests_total`, labeled by `method`
+(`Read` or `Write`), expose active admitted calls and overload rejections.
+Active counts include requests waiting for codecs; no admission queue is
+created.
+
+The limits apply to both identity and Zstd ByteStream transfers. They do not
+limit blob sizes, bytes in flight, total process memory or batch CAS RPCs.
+Metadata RPCs and `QueryWriteStatus` are outside these transfer budgets.
+Clients need bounded retry/backoff or local recovery for overload responses;
+validate that behavior before enabling limits. Slow clients occupy slots
+until their handlers return, so these limits do not replace request deadlines
+or idle-stream handling.
+
 # Join us on Slack!
 
 There is a [#buildbarn channel on buildteamworld.slack.com](https://join.slack.com/t/buildteamworld/shared_invite/zt-3epswjmkj-bsCAPUtTmXEtlPcBl5C_lQ)

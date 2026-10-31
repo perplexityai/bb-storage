@@ -109,6 +109,26 @@ message ApplicationConfiguration {
   // ByteStream server, and enables ZSTD compression for ByteStream
   // operations where the server supports it.
   buildbarn.configuration.zstd.PoolConfiguration zstd_pool = 21;
+
+  // Optional process-wide admission limits for ByteStream reads and writes.
+  // Excess requests fail immediately with RESOURCE_EXHAUSTED, before backend
+  // or codec work, rather than waiting in a queue. Limits apply to IDENTITY
+  // and ZSTD transfers and are shared by all gRPC listeners in this process.
+  // Other RPCs, including metadata and batch CAS requests, are unaffected.
+  ByteStreamAdmissionConfiguration byte_stream_admission = 22;
+}
+
+message ByteStreamAdmissionConfiguration {
+  // Maximum active ByteStream.Read calls, including calls waiting for
+  // storage, codecs, or a slow client. Zero disables this limit.
+  // This bounds requests, not bytes or total process memory.
+  int64 maximum_concurrent_reads = 1;
+
+  // Maximum active ByteStream.Write calls, including calls waiting for
+  // their first message. Read and write capacity are independent. A slot
+  // is released when the handler returns, including on cancellation.
+  // Zero disables this limit. Both limits must be non-negative.
+  int64 maximum_concurrent_writes = 2;
 }
 
 // Storage configuration for backends which don't allow batch digest

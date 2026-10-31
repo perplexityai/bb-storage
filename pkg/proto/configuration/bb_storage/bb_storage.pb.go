@@ -42,6 +42,7 @@ type ApplicationConfiguration struct {
 	ExecuteAuthorizer                 *auth.AuthorizerConfiguration              `protobuf:"bytes,16,opt,name=execute_authorizer,json=executeAuthorizer,proto3" json:"execute_authorizer,omitempty"`
 	SupportedCompressors              []v2.Compressor_Value                      `protobuf:"varint,20,rep,packed,name=supported_compressors,json=supportedCompressors,proto3,enum=build.bazel.remote.execution.v2.Compressor_Value" json:"supported_compressors,omitempty"`
 	ZstdPool                          *zstd.PoolConfiguration                    `protobuf:"bytes,21,opt,name=zstd_pool,json=zstdPool,proto3" json:"zstd_pool,omitempty"`
+	ByteStreamAdmission               *ByteStreamAdmissionConfiguration          `protobuf:"bytes,22,opt,name=byte_stream_admission,json=byteStreamAdmission,proto3" json:"byte_stream_admission,omitempty"`
 	unknownFields                     protoimpl.UnknownFields
 	sizeCache                         protoimpl.SizeCache
 }
@@ -160,6 +161,65 @@ func (x *ApplicationConfiguration) GetZstdPool() *zstd.PoolConfiguration {
 	return nil
 }
 
+func (x *ApplicationConfiguration) GetByteStreamAdmission() *ByteStreamAdmissionConfiguration {
+	if x != nil {
+		return x.ByteStreamAdmission
+	}
+	return nil
+}
+
+type ByteStreamAdmissionConfiguration struct {
+	state                   protoimpl.MessageState `protogen:"open.v1"`
+	MaximumConcurrentReads  int64                  `protobuf:"varint,1,opt,name=maximum_concurrent_reads,json=maximumConcurrentReads,proto3" json:"maximum_concurrent_reads,omitempty"`
+	MaximumConcurrentWrites int64                  `protobuf:"varint,2,opt,name=maximum_concurrent_writes,json=maximumConcurrentWrites,proto3" json:"maximum_concurrent_writes,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
+}
+
+func (x *ByteStreamAdmissionConfiguration) Reset() {
+	*x = ByteStreamAdmissionConfiguration{}
+	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ByteStreamAdmissionConfiguration) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ByteStreamAdmissionConfiguration) ProtoMessage() {}
+
+func (x *ByteStreamAdmissionConfiguration) ProtoReflect() protoreflect.Message {
+	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ByteStreamAdmissionConfiguration.ProtoReflect.Descriptor instead.
+func (*ByteStreamAdmissionConfiguration) Descriptor() ([]byte, []int) {
+	return file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *ByteStreamAdmissionConfiguration) GetMaximumConcurrentReads() int64 {
+	if x != nil {
+		return x.MaximumConcurrentReads
+	}
+	return 0
+}
+
+func (x *ByteStreamAdmissionConfiguration) GetMaximumConcurrentWrites() int64 {
+	if x != nil {
+		return x.MaximumConcurrentWrites
+	}
+	return 0
+}
+
 type NonScannableBlobAccessConfiguration struct {
 	state         protoimpl.MessageState             `protogen:"open.v1"`
 	Backend       *blobstore.BlobAccessConfiguration `protobuf:"bytes,1,opt,name=backend,proto3" json:"backend,omitempty"`
@@ -171,7 +231,7 @@ type NonScannableBlobAccessConfiguration struct {
 
 func (x *NonScannableBlobAccessConfiguration) Reset() {
 	*x = NonScannableBlobAccessConfiguration{}
-	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[1]
+	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -183,7 +243,7 @@ func (x *NonScannableBlobAccessConfiguration) String() string {
 func (*NonScannableBlobAccessConfiguration) ProtoMessage() {}
 
 func (x *NonScannableBlobAccessConfiguration) ProtoReflect() protoreflect.Message {
-	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[1]
+	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -196,7 +256,7 @@ func (x *NonScannableBlobAccessConfiguration) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use NonScannableBlobAccessConfiguration.ProtoReflect.Descriptor instead.
 func (*NonScannableBlobAccessConfiguration) Descriptor() ([]byte, []int) {
-	return file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDescGZIP(), []int{1}
+	return file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *NonScannableBlobAccessConfiguration) GetBackend() *blobstore.BlobAccessConfiguration {
@@ -232,7 +292,7 @@ type ScannableBlobAccessConfiguration struct {
 
 func (x *ScannableBlobAccessConfiguration) Reset() {
 	*x = ScannableBlobAccessConfiguration{}
-	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[2]
+	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -244,7 +304,7 @@ func (x *ScannableBlobAccessConfiguration) String() string {
 func (*ScannableBlobAccessConfiguration) ProtoMessage() {}
 
 func (x *ScannableBlobAccessConfiguration) ProtoReflect() protoreflect.Message {
-	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[2]
+	mi := &file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -257,7 +317,7 @@ func (x *ScannableBlobAccessConfiguration) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ScannableBlobAccessConfiguration.ProtoReflect.Descriptor instead.
 func (*ScannableBlobAccessConfiguration) Descriptor() ([]byte, []int) {
-	return file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDescGZIP(), []int{2}
+	return file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *ScannableBlobAccessConfiguration) GetBackend() *blobstore.BlobAccessConfiguration {
@@ -292,7 +352,7 @@ var File_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_s
 
 const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDesc = "" +
 	"\n" +
-	"Sgithub.com/buildbarn/bb-storage/pkg/proto/configuration/bb_storage/bb_storage.proto\x12\"buildbarn.configuration.bb_storage\x1a6build/bazel/remote/execution/v2/remote_execution.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/auth/auth.proto\x1aQgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blobstore/blobstore.proto\x1aMgithub.com/buildbarn/bb-storage/pkg/proto/configuration/builder/builder.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/global/global.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/zstd/zstd.proto\"\xbd\v\n" +
+	"Sgithub.com/buildbarn/bb-storage/pkg/proto/configuration/bb_storage/bb_storage.proto\x12\"buildbarn.configuration.bb_storage\x1a6build/bazel/remote/execution/v2/remote_execution.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/auth/auth.proto\x1aQgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blobstore/blobstore.proto\x1aMgithub.com/buildbarn/bb-storage/pkg/proto/configuration/builder/builder.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/global/global.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/zstd/zstd.proto\"\xb7\f\n" +
 	"\x18ApplicationConfiguration\x12T\n" +
 	"\fgrpc_servers\x18\x04 \x03(\v21.buildbarn.configuration.grpc.ServerConfigurationR\vgrpcServers\x12l\n" +
 	"\n" +
@@ -308,10 +368,14 @@ const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb
 	"\x18file_system_access_cache\x18\x13 \x01(\v2G.buildbarn.configuration.bb_storage.NonScannableBlobAccessConfigurationR\x15fileSystemAccessCache\x12d\n" +
 	"\x12execute_authorizer\x18\x10 \x01(\v25.buildbarn.configuration.auth.AuthorizerConfigurationR\x11executeAuthorizer\x12f\n" +
 	"\x15supported_compressors\x18\x14 \x03(\x0e21.build.bazel.remote.execution.v2.Compressor.ValueR\x14supportedCompressors\x12L\n" +
-	"\tzstd_pool\x18\x15 \x01(\v2/.buildbarn.configuration.zstd.PoolConfigurationR\bzstdPool\x1av\n" +
+	"\tzstd_pool\x18\x15 \x01(\v2/.buildbarn.configuration.zstd.PoolConfigurationR\bzstdPool\x12x\n" +
+	"\x15byte_stream_admission\x18\x16 \x01(\v2D.buildbarn.configuration.bb_storage.ByteStreamAdmissionConfigurationR\x13byteStreamAdmission\x1av\n" +
 	"\x0fSchedulersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12M\n" +
-	"\x05value\x18\x02 \x01(\v27.buildbarn.configuration.builder.SchedulerConfigurationR\x05value:\x028\x01J\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\f\x10\rJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10\"\xb7\x02\n" +
+	"\x05value\x18\x02 \x01(\v27.buildbarn.configuration.builder.SchedulerConfigurationR\x05value:\x028\x01J\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\f\x10\rJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10\"\x98\x01\n" +
+	" ByteStreamAdmissionConfiguration\x128\n" +
+	"\x18maximum_concurrent_reads\x18\x01 \x01(\x03R\x16maximumConcurrentReads\x12:\n" +
+	"\x19maximum_concurrent_writes\x18\x02 \x01(\x03R\x17maximumConcurrentWrites\"\xb7\x02\n" +
 	"#NonScannableBlobAccessConfiguration\x12T\n" +
 	"\abackend\x18\x01 \x01(\v2:.buildbarn.configuration.blobstore.BlobAccessConfigurationR\abackend\x12\\\n" +
 	"\x0eget_authorizer\x18\x02 \x01(\v25.buildbarn.configuration.auth.AuthorizerConfigurationR\rgetAuthorizer\x12\\\n" +
@@ -334,45 +398,47 @@ func file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_
 	return file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDescData
 }
 
-var file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes = make([]protoimpl.MessageInfo, 4)
+var file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
 var file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_goTypes = []any{
 	(*ApplicationConfiguration)(nil),            // 0: buildbarn.configuration.bb_storage.ApplicationConfiguration
-	(*NonScannableBlobAccessConfiguration)(nil), // 1: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
-	(*ScannableBlobAccessConfiguration)(nil),    // 2: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration
-	nil,                                         // 3: buildbarn.configuration.bb_storage.ApplicationConfiguration.SchedulersEntry
-	(*grpc.ServerConfiguration)(nil),            // 4: buildbarn.configuration.grpc.ServerConfiguration
-	(*global.Configuration)(nil),                // 5: buildbarn.configuration.global.Configuration
-	(*auth.AuthorizerConfiguration)(nil),        // 6: buildbarn.configuration.auth.AuthorizerConfiguration
-	(v2.Compressor_Value)(0),                    // 7: build.bazel.remote.execution.v2.Compressor.Value
-	(*zstd.PoolConfiguration)(nil),              // 8: buildbarn.configuration.zstd.PoolConfiguration
-	(*blobstore.BlobAccessConfiguration)(nil),   // 9: buildbarn.configuration.blobstore.BlobAccessConfiguration
-	(*builder.SchedulerConfiguration)(nil),      // 10: buildbarn.configuration.builder.SchedulerConfiguration
+	(*ByteStreamAdmissionConfiguration)(nil),    // 1: buildbarn.configuration.bb_storage.ByteStreamAdmissionConfiguration
+	(*NonScannableBlobAccessConfiguration)(nil), // 2: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
+	(*ScannableBlobAccessConfiguration)(nil),    // 3: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration
+	nil,                                         // 4: buildbarn.configuration.bb_storage.ApplicationConfiguration.SchedulersEntry
+	(*grpc.ServerConfiguration)(nil),            // 5: buildbarn.configuration.grpc.ServerConfiguration
+	(*global.Configuration)(nil),                // 6: buildbarn.configuration.global.Configuration
+	(*auth.AuthorizerConfiguration)(nil),        // 7: buildbarn.configuration.auth.AuthorizerConfiguration
+	(v2.Compressor_Value)(0),                    // 8: build.bazel.remote.execution.v2.Compressor.Value
+	(*zstd.PoolConfiguration)(nil),              // 9: buildbarn.configuration.zstd.PoolConfiguration
+	(*blobstore.BlobAccessConfiguration)(nil),   // 10: buildbarn.configuration.blobstore.BlobAccessConfiguration
+	(*builder.SchedulerConfiguration)(nil),      // 11: buildbarn.configuration.builder.SchedulerConfiguration
 }
 var file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_depIdxs = []int32{
-	4,  // 0: buildbarn.configuration.bb_storage.ApplicationConfiguration.grpc_servers:type_name -> buildbarn.configuration.grpc.ServerConfiguration
-	3,  // 1: buildbarn.configuration.bb_storage.ApplicationConfiguration.schedulers:type_name -> buildbarn.configuration.bb_storage.ApplicationConfiguration.SchedulersEntry
-	5,  // 2: buildbarn.configuration.bb_storage.ApplicationConfiguration.global:type_name -> buildbarn.configuration.global.Configuration
-	2,  // 3: buildbarn.configuration.bb_storage.ApplicationConfiguration.content_addressable_storage:type_name -> buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration
-	1,  // 4: buildbarn.configuration.bb_storage.ApplicationConfiguration.action_cache:type_name -> buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
-	2,  // 5: buildbarn.configuration.bb_storage.ApplicationConfiguration.indirect_content_addressable_storage:type_name -> buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration
-	1,  // 6: buildbarn.configuration.bb_storage.ApplicationConfiguration.initial_size_class_cache:type_name -> buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
-	1,  // 7: buildbarn.configuration.bb_storage.ApplicationConfiguration.file_system_access_cache:type_name -> buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
-	6,  // 8: buildbarn.configuration.bb_storage.ApplicationConfiguration.execute_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
-	7,  // 9: buildbarn.configuration.bb_storage.ApplicationConfiguration.supported_compressors:type_name -> build.bazel.remote.execution.v2.Compressor.Value
-	8,  // 10: buildbarn.configuration.bb_storage.ApplicationConfiguration.zstd_pool:type_name -> buildbarn.configuration.zstd.PoolConfiguration
-	9,  // 11: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration.backend:type_name -> buildbarn.configuration.blobstore.BlobAccessConfiguration
-	6,  // 12: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration.get_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
-	6,  // 13: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration.put_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
-	9,  // 14: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.backend:type_name -> buildbarn.configuration.blobstore.BlobAccessConfiguration
-	6,  // 15: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.get_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
-	6,  // 16: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.put_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
-	6,  // 17: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.find_missing_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
-	10, // 18: buildbarn.configuration.bb_storage.ApplicationConfiguration.SchedulersEntry.value:type_name -> buildbarn.configuration.builder.SchedulerConfiguration
-	19, // [19:19] is the sub-list for method output_type
-	19, // [19:19] is the sub-list for method input_type
-	19, // [19:19] is the sub-list for extension type_name
-	19, // [19:19] is the sub-list for extension extendee
-	0,  // [0:19] is the sub-list for field type_name
+	5,  // 0: buildbarn.configuration.bb_storage.ApplicationConfiguration.grpc_servers:type_name -> buildbarn.configuration.grpc.ServerConfiguration
+	4,  // 1: buildbarn.configuration.bb_storage.ApplicationConfiguration.schedulers:type_name -> buildbarn.configuration.bb_storage.ApplicationConfiguration.SchedulersEntry
+	6,  // 2: buildbarn.configuration.bb_storage.ApplicationConfiguration.global:type_name -> buildbarn.configuration.global.Configuration
+	3,  // 3: buildbarn.configuration.bb_storage.ApplicationConfiguration.content_addressable_storage:type_name -> buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration
+	2,  // 4: buildbarn.configuration.bb_storage.ApplicationConfiguration.action_cache:type_name -> buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
+	3,  // 5: buildbarn.configuration.bb_storage.ApplicationConfiguration.indirect_content_addressable_storage:type_name -> buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration
+	2,  // 6: buildbarn.configuration.bb_storage.ApplicationConfiguration.initial_size_class_cache:type_name -> buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
+	2,  // 7: buildbarn.configuration.bb_storage.ApplicationConfiguration.file_system_access_cache:type_name -> buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration
+	7,  // 8: buildbarn.configuration.bb_storage.ApplicationConfiguration.execute_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
+	8,  // 9: buildbarn.configuration.bb_storage.ApplicationConfiguration.supported_compressors:type_name -> build.bazel.remote.execution.v2.Compressor.Value
+	9,  // 10: buildbarn.configuration.bb_storage.ApplicationConfiguration.zstd_pool:type_name -> buildbarn.configuration.zstd.PoolConfiguration
+	1,  // 11: buildbarn.configuration.bb_storage.ApplicationConfiguration.byte_stream_admission:type_name -> buildbarn.configuration.bb_storage.ByteStreamAdmissionConfiguration
+	10, // 12: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration.backend:type_name -> buildbarn.configuration.blobstore.BlobAccessConfiguration
+	7,  // 13: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration.get_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
+	7,  // 14: buildbarn.configuration.bb_storage.NonScannableBlobAccessConfiguration.put_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
+	10, // 15: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.backend:type_name -> buildbarn.configuration.blobstore.BlobAccessConfiguration
+	7,  // 16: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.get_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
+	7,  // 17: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.put_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
+	7,  // 18: buildbarn.configuration.bb_storage.ScannableBlobAccessConfiguration.find_missing_authorizer:type_name -> buildbarn.configuration.auth.AuthorizerConfiguration
+	11, // 19: buildbarn.configuration.bb_storage.ApplicationConfiguration.SchedulersEntry.value:type_name -> buildbarn.configuration.builder.SchedulerConfiguration
+	20, // [20:20] is the sub-list for method output_type
+	20, // [20:20] is the sub-list for method input_type
+	20, // [20:20] is the sub-list for extension type_name
+	20, // [20:20] is the sub-list for extension extendee
+	0,  // [0:20] is the sub-list for field type_name
 }
 
 func init() {
@@ -388,7 +454,7 @@ func file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDesc), len(file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   4,
+			NumMessages:   5,
 			NumExtensions: 0,
 			NumServices:   0,
 		},
