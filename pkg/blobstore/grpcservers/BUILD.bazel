@@ -4,6 +4,7 @@ go_library(
     name = "grpcservers",
     srcs = [
         "action_cache_server.go",
+        "admission_controlled_byte_stream_server.go",
         "byte_stream_server.go",
         "content_addressable_storage_server.go",
         "file_system_access_cache_server.go",
@@ -22,16 +23,19 @@ go_library(
         "//pkg/util",
         "//pkg/zstd",
         "@bazel_remote_apis//build/bazel/remote/execution/v2:remote_execution_go_proto",
+        "@com_github_prometheus_client_golang//prometheus",
         "@org_golang_google_genproto_googleapis_bytestream//:bytestream",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",
         "@org_golang_google_protobuf//types/known/emptypb",
+        "@org_golang_x_sync//semaphore",
     ],
 )
 
 go_test(
     name = "grpcservers_test",
     srcs = [
+        "admission_controlled_byte_stream_server_test.go",
         "byte_stream_admission_test.go",
         "byte_stream_codec_order_test.go",
         "byte_stream_server_test.go",

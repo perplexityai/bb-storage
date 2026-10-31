@@ -189,6 +189,21 @@ func main() {
 			capabilitiesProviders = append(capabilitiesProviders, buildQueue)
 		}
 
+		// Share admission state across listeners, rather than granting each
+		// listening socket an independent transfer budget.
+		var byteStreamServer bytestream.ByteStreamServer
+		if contentAddressableStorage != nil {
+			byteStreamServer = grpcservers.NewByteStreamServer(contentAddressableStorage, 1<<16, zstdPool)
+			if admission := configuration.ByteStreamAdmission; admission != nil {
+				byteStreamServer, err = grpcservers.NewAdmissionControlledByteStreamServer(
+					byteStreamServer, admission.MaximumConcurrentReads, admission.MaximumConcurrentWrites,
+				)
+				if err != nil {
+					return util.StatusWrap(err, "Failed to configure ByteStream admission")
+				}
+			}
+		}
+
 		if err := bb_grpc.NewServersFromConfigurationAndServe(
 			configuration.GrpcServers,
 			func(s grpc.ServiceRegistrar) {
@@ -200,14 +215,7 @@ func main() {
 							configuration.MaximumMessageSizeBytes,
 						),
 					)
-					bytestream.RegisterByteStreamServer(
-						s,
-						grpcservers.NewByteStreamServer(
-							contentAddressableStorage,
-							1<<16,
-							zstdPool,
-						),
-					)
+					bytestream.RegisterByteStreamServer(s, byteStreamServer)
 				}
 				if actionCache != nil {
 					remoteexecution.RegisterActionCacheServer(

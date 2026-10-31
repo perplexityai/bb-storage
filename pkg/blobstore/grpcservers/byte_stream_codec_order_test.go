@@ -63,7 +63,7 @@ type codecOrderStorage struct {
 	written chan []byte
 }
 
-func (s *codecOrderStorage) Get(context.Context, digest.Digest) buffer.Buffer {
+func (*codecOrderStorage) Get(context.Context, digest.Digest) buffer.Buffer {
 	return buffer.NewValidatedBufferFromByteSlice([]byte("hello"))
 }
 
@@ -126,7 +126,10 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	require.NoError(t, err)
 	defer conn.Close()
 	backend := grpcclients.NewCASBlobAccess(conn, uuid.NewRandom, 64, backendPool)
-	frontend := grpcservers.NewByteStreamServer(backend, 64, frontendPool)
+	frontend, err := grpcservers.NewAdmissionControlledByteStreamServer(
+		grpcservers.NewByteStreamServer(backend, 64, frontendPool), 1, 1,
+	)
+	require.NoError(t, err)
 
 	blobDigest := digest.MustNewDigest("", remoteexecution.DigestFunction_SHA256, "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", 5)
 	encoder, err := zstd.NewWriter(nil, encoderOptions...)

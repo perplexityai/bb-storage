@@ -91,7 +91,10 @@ func TestByteStreamEncoderWaitCancellation(t *testing.T) {
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, occupied.Close()) })
 			backend := &admissionBackend{}
-			server := grpcservers.NewByteStreamServer(backend, 64, pool)
+			server, err := grpcservers.NewAdmissionControlledByteStreamServer(
+				grpcservers.NewByteStreamServer(backend, 64, pool), 1, 1,
+			)
+			require.NoError(t, err)
 			ctx, cancel := context.WithCancel(t.Context())
 			if cancellation == codes.DeadlineExceeded {
 				cancel()
@@ -138,13 +141,19 @@ func TestByteStreamEncoderWaitCancellation(t *testing.T) {
 	t.Run("BackendFailureReleasesEncoder", func(t *testing.T) {
 		pool := bb_zstd.NewBoundedPool(1, 1, nil, nil)
 		backend := &admissionBackend{err: status.Error(codes.NotFound, "missing blob")}
-		server := grpcservers.NewByteStreamServer(backend, 64, pool)
-		err := server.Read(&bytestream.ReadRequest{ResourceName: resourceName}, &admissionReadStream{ctx: t.Context()})
+		server, err := grpcservers.NewAdmissionControlledByteStreamServer(
+			grpcservers.NewByteStreamServer(backend, 64, pool), 1, 1,
+		)
+		require.NoError(t, err)
+		err = server.Read(&bytestream.ReadRequest{ResourceName: resourceName}, &admissionReadStream{ctx: t.Context()})
 		require.Equal(t, codes.NotFound, status.Code(err))
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
 		encoder, err := pool.NewEncoder(ctx, io.Discard)
 		require.NoError(t, err, "backend errors must return the encoder to the pool")
 		require.NoError(t, encoder.Close())
+		err = server.Read(&bytestream.ReadRequest{ResourceName: resourceName}, &admissionReadStream{ctx: ctx})
+		require.Equal(t, codes.NotFound, status.Code(err), "backend errors must also return the admission slot")
+		require.EqualValues(t, 2, backend.gets.Load())
 	})
 }
