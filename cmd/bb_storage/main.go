@@ -38,6 +38,9 @@ func main() {
 		if err := util.UnmarshalConfigurationFromFile(os.Args[1], &configuration); err != nil {
 			return util.StatusWrapf(err, "Failed to read configuration from %s", os.Args[1])
 		}
+		if configuration.MaximumCasBlobSizeBytes < 0 {
+			return status.Error(codes.InvalidArgument, "Maximum CAS blob size cannot be negative")
+		}
 		lifecycleState, grpcClientFactory, err := global.ApplyConfiguration(configuration.Global, dependenciesGroup)
 		if err != nil {
 			return util.StatusWrap(err, "Failed to apply global configuration options")
@@ -164,10 +167,16 @@ func main() {
 
 		var capabilitiesProviders []capabilities.Provider
 		if len(cacheCapabilitiesProviders) > 0 {
+			cacheProvider, err := capabilities.NewCASBlobSizeLimitingProvider(
+				capabilities.NewMergingProvider(cacheCapabilitiesProviders), configuration.MaximumCasBlobSizeBytes,
+			)
+			if err != nil {
+				return err
+			}
 			capabilitiesProviders = append(
 				capabilitiesProviders,
 				capabilities.NewAuthorizingProvider(
-					capabilities.NewMergingProvider(cacheCapabilitiesProviders),
+					cacheProvider,
 					auth.NewAnyAuthorizer(cacheCapabilitiesAuthorizers),
 				),
 			)
@@ -191,9 +200,21 @@ func main() {
 
 		// Share admission state across listeners, rather than granting each
 		// listening socket an independent transfer budget.
+		var casServer remoteexecution.ContentAddressableStorageServer
 		var byteStreamServer bytestream.ByteStreamServer
 		if contentAddressableStorage != nil {
-			byteStreamServer = grpcservers.NewByteStreamServer(contentAddressableStorage, 1<<16, zstdPool)
+			casServer, err = grpcservers.NewContentAddressableStorageServerWithMaximumBlobSize(
+				contentAddressableStorage, configuration.MaximumMessageSizeBytes, configuration.MaximumCasBlobSizeBytes,
+			)
+			if err != nil {
+				return err
+			}
+			byteStreamServer, err = grpcservers.NewByteStreamServerWithMaximumBlobSize(
+				contentAddressableStorage, 1<<16, zstdPool, configuration.MaximumCasBlobSizeBytes,
+			)
+			if err != nil {
+				return err
+			}
 			if admission := configuration.ByteStreamAdmission; admission != nil {
 				byteStreamServer, err = grpcservers.NewAdmissionControlledByteStreamServer(
 					byteStreamServer, admission.MaximumConcurrentReads, admission.MaximumConcurrentWrites,
@@ -202,6 +223,7 @@ func main() {
 					return util.StatusWrap(err, "Failed to configure ByteStream admission")
 				}
 			}
+
 		}
 
 		if err := bb_grpc.NewServersFromConfigurationAndServe(
@@ -210,12 +232,12 @@ func main() {
 				if contentAddressableStorage != nil {
 					remoteexecution.RegisterContentAddressableStorageServer(
 						s,
-						grpcservers.NewContentAddressableStorageServer(
-							contentAddressableStorage,
-							configuration.MaximumMessageSizeBytes,
-						),
+						casServer,
 					)
-					bytestream.RegisterByteStreamServer(s, byteStreamServer)
+					bytestream.RegisterByteStreamServer(
+						s,
+						byteStreamServer,
+					)
 				}
 				if actionCache != nil {
 					remoteexecution.RegisterActionCacheServer(

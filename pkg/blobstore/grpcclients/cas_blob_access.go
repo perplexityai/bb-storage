@@ -395,7 +395,8 @@ func (ba *casBlobAccess) GetCapabilities(ctx context.Context, instanceName diges
 	// issue batch operations.
 	return &remoteexecution.ServerCapabilities{
 		CacheCapabilities: &remoteexecution.CacheCapabilities{
-			DigestFunctions: digest.RemoveUnsupportedDigestFunctions(cacheCapabilities.DigestFunctions),
+			DigestFunctions:     digest.RemoveUnsupportedDigestFunctions(cacheCapabilities.DigestFunctions),
+			MaxCasBlobSizeBytes: cacheCapabilities.MaxCasBlobSizeBytes,
 		},
 		DeprecatedApiVersion: serverCapabilities.DeprecatedApiVersion,
 		LowApiVersion:        serverCapabilities.LowApiVersion,

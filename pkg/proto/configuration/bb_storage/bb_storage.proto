@@ -116,6 +116,13 @@ message ApplicationConfiguration {
   // and ZSTD transfers and are shared by all gRPC listeners in this process.
   // Other RPCs, including metadata and batch CAS requests, are unaffected.
   ByteStreamAdmissionConfiguration byte_stream_admission = 22;
+
+  // Maximum uncompressed size of an individual CAS blob accepted through
+  // ByteStream.Write or BatchUpdateBlobs. Zero disables the limit; negative
+  // values are invalid. Oversized uploads return INVALID_ARGUMENT before
+  // decoder or storage work. Existing larger blobs remain readable.
+  // Advertised through CacheCapabilities.max_cas_blob_size_bytes.
+  int64 maximum_cas_blob_size_bytes = 23;
 }
 
 message ByteStreamAdmissionConfiguration {

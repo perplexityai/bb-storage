@@ -18,20 +18,32 @@ import (
 )
 
 type byteStreamServer struct {
-	blobAccess    blobstore.BlobAccess
-	readChunkSize int
-	zstdPool      bb_zstd.Pool
+	blobAccess           blobstore.BlobAccess
+	readChunkSize        int
+	zstdPool             bb_zstd.Pool
+	maximumBlobSizeBytes int64
 }
 
 // NewByteStreamServer creates a GRPC service for reading blobs from and
 // writing blobs to a BlobAccess. It is used by Bazel to access the
 // Content Addressable Storage (CAS).
 func NewByteStreamServer(blobAccess blobstore.BlobAccess, readChunkSize int, zstdPool bb_zstd.Pool) bytestream.ByteStreamServer {
-	return &byteStreamServer{
-		blobAccess:    blobAccess,
-		readChunkSize: readChunkSize,
-		zstdPool:      zstdPool,
+	server, _ := NewByteStreamServerWithMaximumBlobSize(blobAccess, readChunkSize, zstdPool, 0)
+	return server
+}
+
+// NewByteStreamServerWithMaximumBlobSize limits the logical size of CAS
+// uploads. Zero disables the limit; reads of existing larger blobs remain valid.
+func NewByteStreamServerWithMaximumBlobSize(blobAccess blobstore.BlobAccess, readChunkSize int, zstdPool bb_zstd.Pool, maximumBlobSizeBytes int64) (bytestream.ByteStreamServer, error) {
+	if maximumBlobSizeBytes < 0 {
+		return nil, status.Error(codes.InvalidArgument, "Maximum CAS blob size cannot be negative")
 	}
+	return &byteStreamServer{
+		maximumBlobSizeBytes: maximumBlobSizeBytes,
+		blobAccess:           blobAccess,
+		readChunkSize:        readChunkSize,
+		zstdPool:             zstdPool,
+	}, nil
 }
 
 func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteStream_ReadServer) error {
@@ -165,6 +177,9 @@ func (s *byteStreamServer) Write(stream bytestream.ByteStream_WriteServer) error
 	}
 	digest, compressor, err := digest.NewDigestFromByteStreamWritePath(request.ResourceName)
 	if err != nil {
+		return err
+	}
+	if err := checkCASUploadSize(digest, s.maximumBlobSizeBytes); err != nil {
 		return err
 	}
 	switch compressor {

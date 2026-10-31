@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "action_cache_update_enabled_clearing_provider.go",
         "authorizing_provider.go",
+        "cas_blob_size_limiting_provider.go",
         "merging_provider.go",
         "provider.go",
         "server.go",
@@ -29,6 +30,7 @@ go_test(
     name = "capabilities_test",
     srcs = [
         "action_cache_update_enabled_clearing_provider_test.go",
+        "cas_blob_size_limiting_provider_test.go",
         "merging_provider_test.go",
         "server_test.go",
         "static_provider_test.go",

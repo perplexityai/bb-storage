@@ -43,6 +43,7 @@ type ApplicationConfiguration struct {
 	SupportedCompressors              []v2.Compressor_Value                      `protobuf:"varint,20,rep,packed,name=supported_compressors,json=supportedCompressors,proto3,enum=build.bazel.remote.execution.v2.Compressor_Value" json:"supported_compressors,omitempty"`
 	ZstdPool                          *zstd.PoolConfiguration                    `protobuf:"bytes,21,opt,name=zstd_pool,json=zstdPool,proto3" json:"zstd_pool,omitempty"`
 	ByteStreamAdmission               *ByteStreamAdmissionConfiguration          `protobuf:"bytes,22,opt,name=byte_stream_admission,json=byteStreamAdmission,proto3" json:"byte_stream_admission,omitempty"`
+	MaximumCasBlobSizeBytes           int64                                      `protobuf:"varint,23,opt,name=maximum_cas_blob_size_bytes,json=maximumCasBlobSizeBytes,proto3" json:"maximum_cas_blob_size_bytes,omitempty"`
 	unknownFields                     protoimpl.UnknownFields
 	sizeCache                         protoimpl.SizeCache
 }
@@ -166,6 +167,13 @@ func (x *ApplicationConfiguration) GetByteStreamAdmission() *ByteStreamAdmission
 		return x.ByteStreamAdmission
 	}
 	return nil
+}
+
+func (x *ApplicationConfiguration) GetMaximumCasBlobSizeBytes() int64 {
+	if x != nil {
+		return x.MaximumCasBlobSizeBytes
+	}
+	return 0
 }
 
 type ByteStreamAdmissionConfiguration struct {
@@ -352,7 +360,7 @@ var File_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_s
 
 const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb_storage_proto_rawDesc = "" +
 	"\n" +
-	"Sgithub.com/buildbarn/bb-storage/pkg/proto/configuration/bb_storage/bb_storage.proto\x12\"buildbarn.configuration.bb_storage\x1a6build/bazel/remote/execution/v2/remote_execution.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/auth/auth.proto\x1aQgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blobstore/blobstore.proto\x1aMgithub.com/buildbarn/bb-storage/pkg/proto/configuration/builder/builder.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/global/global.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/zstd/zstd.proto\"\xb7\f\n" +
+	"Sgithub.com/buildbarn/bb-storage/pkg/proto/configuration/bb_storage/bb_storage.proto\x12\"buildbarn.configuration.bb_storage\x1a6build/bazel/remote/execution/v2/remote_execution.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/auth/auth.proto\x1aQgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blobstore/blobstore.proto\x1aMgithub.com/buildbarn/bb-storage/pkg/proto/configuration/builder/builder.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/global/global.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/zstd/zstd.proto\"\xf5\f\n" +
 	"\x18ApplicationConfiguration\x12T\n" +
 	"\fgrpc_servers\x18\x04 \x03(\v21.buildbarn.configuration.grpc.ServerConfigurationR\vgrpcServers\x12l\n" +
 	"\n" +
@@ -369,7 +377,8 @@ const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_bb_storage_bb
 	"\x12execute_authorizer\x18\x10 \x01(\v25.buildbarn.configuration.auth.AuthorizerConfigurationR\x11executeAuthorizer\x12f\n" +
 	"\x15supported_compressors\x18\x14 \x03(\x0e21.build.bazel.remote.execution.v2.Compressor.ValueR\x14supportedCompressors\x12L\n" +
 	"\tzstd_pool\x18\x15 \x01(\v2/.buildbarn.configuration.zstd.PoolConfigurationR\bzstdPool\x12x\n" +
-	"\x15byte_stream_admission\x18\x16 \x01(\v2D.buildbarn.configuration.bb_storage.ByteStreamAdmissionConfigurationR\x13byteStreamAdmission\x1av\n" +
+	"\x15byte_stream_admission\x18\x16 \x01(\v2D.buildbarn.configuration.bb_storage.ByteStreamAdmissionConfigurationR\x13byteStreamAdmission\x12<\n" +
+	"\x1bmaximum_cas_blob_size_bytes\x18\x17 \x01(\x03R\x17maximumCasBlobSizeBytes\x1av\n" +
 	"\x0fSchedulersEntry\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\tR\x03key\x12M\n" +
 	"\x05value\x18\x02 \x01(\v27.buildbarn.configuration.builder.SchedulerConfigurationR\x05value:\x028\x01J\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\x06\x10\aJ\x04\b\a\x10\bJ\x04\b\f\x10\rJ\x04\b\r\x10\x0eJ\x04\b\x0e\x10\x0fJ\x04\b\x0f\x10\x10\"\x98\x01\n" +
