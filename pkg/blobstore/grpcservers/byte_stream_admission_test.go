@@ -38,8 +38,9 @@ func (p *observedEncoderPool) NewEncoder(ctx context.Context, w io.Writer) (bb_z
 // The backend boundary counts requests that would otherwise start storage RPCs.
 type admissionBackend struct {
 	blobstore.BlobAccess
-	gets atomic.Int64
-	err  error
+	gets   atomic.Int64
+	closed atomic.Int64
+	err    error
 }
 
 func (b *admissionBackend) Get(context.Context, digest.Digest) buffer.Buffer {
@@ -47,7 +48,20 @@ func (b *admissionBackend) Get(context.Context, digest.Digest) buffer.Buffer {
 	if b.err != nil {
 		return buffer.NewBufferFromError(b.err)
 	}
-	return buffer.NewValidatedBufferFromByteSlice([]byte("hello"))
+	return buffer.NewValidatedBufferFromReaderAt(&admissionReader{
+		Reader: bytes.NewReader([]byte("hello")),
+		closed: &b.closed,
+	}, 5)
+}
+
+type admissionReader struct {
+	*bytes.Reader
+	closed *atomic.Int64
+}
+
+func (r *admissionReader) Close() error {
+	r.closed.Add(1)
+	return nil
 }
 
 type admissionReadStream struct {
@@ -63,7 +77,7 @@ func (s *admissionReadStream) Send(response *bytestream.ReadResponse) error {
 	return err
 }
 
-func TestByteStreamEncoderAdmission(t *testing.T) {
+func TestByteStreamEncoderWaitCancellation(t *testing.T) {
 	const resourceName = "compressed-blobs/zstd/2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824/5"
 	for _, cancellation := range []codes.Code{codes.Canceled, codes.DeadlineExceeded} {
 		t.Run(cancellation.String(), func(t *testing.T) {
@@ -98,8 +112,8 @@ func TestByteStreamEncoderAdmission(t *testing.T) {
 			}
 			select {
 			case err := <-completed:
-				require.Zero(t, backend.gets.Load(), "waiting for an encoder must not start a storage read")
 				require.Equal(t, cancellation, status.Code(err))
+				require.EqualValues(t, 1, backend.closed.Load(), "cancellation must discard the backend buffer")
 			case <-time.After(5 * time.Second):
 				t.Fatal("canceled read did not release its waiter")
 			}
@@ -110,7 +124,8 @@ func TestByteStreamEncoderAdmission(t *testing.T) {
 			defer nextCancel()
 			out := &admissionReadStream{ctx: nextCtx}
 			require.NoError(t, server.Read(&bytestream.ReadRequest{ResourceName: resourceName}, out))
-			require.EqualValues(t, 1, backend.gets.Load())
+			require.EqualValues(t, 2, backend.gets.Load())
+			require.EqualValues(t, 2, backend.closed.Load())
 			decoder, err := zstd.NewReader(nil)
 			require.NoError(t, err)
 			defer decoder.Close()
