@@ -117,12 +117,71 @@ func writeAll(w io.Writer, p []byte) error {
 	return err
 }
 
+func writeWithContext(ctx context.Context, w io.Writer, p []byte) error {
+	if err := checkContext(ctx); err != nil {
+		return err
+	}
+	if err := writeAll(w, p); err != nil {
+		return err
+	}
+	return checkContext(ctx)
+}
+
+func readAtFull(r io.ReaderAt, p []byte, off int64) error {
+	n, err := r.ReadAt(p, off)
+	// ReaderAt permits EOF alongside a complete read, including the footer
+	// at the end of a file. Other errors must not disappear with the bytes.
+	if n == len(p) && err == io.EOF {
+		return nil
+	}
+	if n != len(p) && (err == nil || err == io.EOF) {
+		return io.ErrUnexpectedEOF
+	}
+	return err
+}
+
+type terminalErrorReader struct {
+	source io.Reader
+	err    error
+}
+
+func (r *terminalErrorReader) Read(p []byte) (int, error) {
+	if r.err != nil {
+		return 0, r.err
+	}
+	n, err := r.source.Read(p)
+	r.err = err
+	return n, err
+}
+
+func compressFrame(ctx context.Context, data []byte, frameSize int, pool zstd.Pool) ([]byte, error) {
+	if len(data) == 0 {
+		// Pool encoders may suppress empty frames. Emit a single-segment frame
+		// with content size zero and one final empty raw block (RFC 8878, 3.1.1).
+		return []byte{0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00}, nil
+	}
+	encoded := boundedWriter{limit: encodedLimit(frameSize)}
+	encoder, err := pool.NewEncoder(ctx, &encoded)
+	if err != nil {
+		return nil, err
+	}
+	writeErr := writeAll(encoder, data)
+	closeErr := encoder.Close()
+	if writeErr != nil {
+		return nil, writeErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return encoded.Bytes(), nil
+}
+
 // Encode writes a versioned representation, validating the entire logical
 // digest before writing its index and commit footer. Callers must write to a
-// temporary object and publish it only after success; failures leave partial
-// output. The caller owns both streams and is responsible for interrupting
-// blocked I/O on cancellation. Working memory is bounded by a frame, a codec,
-// and at most 65536 index entries, independent of the logical blob size.
+// temporary object and publish it only after success; even a complete footer
+// may accompany a final I/O error or cancellation. The caller owns both streams
+// and must interrupt blocked I/O on cancellation. Memory is bounded by a frame,
+// a codec, and at most 65536 index entries, independent of logical blob size.
 func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, frameSize int, pool zstd.Pool) error {
 	if err := checkContext(ctx); err != nil {
 		return err
@@ -137,46 +196,46 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 	idx := index{Hash: d.GetHashString(), Size: size, Function: d.GetDigestFunction().GetEnumValue(), FrameSize: frameSize}
 	whole := d.GetDigestFunction().NewGenerator(size)
 	data := make([]byte, frameSize)
+	source := terminalErrorReader{source: src}
 	var offset int64
-	for remaining := size; remaining > 0; {
+	for remaining := size; remaining > 0 || len(idx.Frames) == 0; {
 		if err := checkContext(ctx); err != nil {
 			return err
 		}
 		n := min(int64(frameSize), remaining)
 		p := data[:int(n)]
-		if _, err := io.ReadFull(src, p); err != nil {
+		if _, err := io.ReadFull(&source, p); err != nil {
+			return err
+		}
+		// ReadFull drops errors delivered with exactly len(p) bytes. Retain
+		// terminal source failures so verified bytes cannot hide a failed read.
+		if source.err != nil && source.err != io.EOF {
+			return source.err
+		}
+		if err := checkContext(ctx); err != nil {
 			return err
 		}
 		whole.Write(p)
 		part := d.GetDigestFunction().NewGenerator(n)
 		part.Write(p)
-		encoded := boundedWriter{limit: encodedLimit(frameSize)}
-		encoder, err := pool.NewEncoder(ctx, &encoded)
+		encoded, err := compressFrame(ctx, p, frameSize, pool)
 		if err != nil {
 			return err
 		}
-		writeErr := writeAll(encoder, p)
-		closeErr := encoder.Close()
-		if writeErr != nil {
-			return writeErr
-		}
-		if closeErr != nil {
-			return closeErr
-		}
-		if err := checkContext(ctx); err != nil {
+		if err := writeWithContext(ctx, dst, encoded); err != nil {
 			return err
 		}
-		if err := writeAll(dst, encoded.Bytes()); err != nil {
-			return err
-		}
-		h := sha256.Sum256(encoded.Bytes())
-		idx.Frames = append(idx.Frames, frame{Hash: part.Sum().GetHashString(), Size: n, Offset: offset, EncodedSize: int64(encoded.Len()), EncodedHash: hex.EncodeToString(h[:])})
-		offset += int64(encoded.Len())
+		h := sha256.Sum256(encoded)
+		idx.Frames = append(idx.Frames, frame{Hash: part.Sum().GetHashString(), Size: n, Offset: offset, EncodedSize: int64(len(encoded)), EncodedHash: hex.EncodeToString(h[:])})
+		offset += int64(len(encoded))
 		remaining -= n
 	}
 	// Reading through EOF detects extra data and deferred source errors.
 	var extra [1]byte
-	if n, err := io.ReadFull(src, extra[:]); n != 0 || err != io.EOF {
+	if n, err := io.ReadFull(&source, extra[:]); n != 0 || err != io.EOF {
+		if source.err != nil && source.err != io.EOF {
+			return source.err
+		}
 		if err != nil && err != io.EOF {
 			return err
 		}
@@ -195,7 +254,7 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 	if len(metadata) > maximumIndexSize {
 		return status.Error(codes.ResourceExhausted, "Frame index exceeds its size budget")
 	}
-	if err := writeAll(dst, metadata); err != nil {
+	if err := writeWithContext(ctx, dst, metadata); err != nil {
 		return err
 	}
 	var footer [footerSize]byte
@@ -203,7 +262,7 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 	binary.LittleEndian.PutUint64(footer[8:16], uint64(len(metadata)))
 	h := sha256.Sum256(metadata)
 	copy(footer[16:], h[:])
-	return writeAll(dst, footer[:])
+	return writeWithContext(ctx, dst, footer[:])
 }
 
 // Open checks the bounded index and its checksum against the expected logical
@@ -218,7 +277,7 @@ func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, erro
 		return bad()
 	}
 	var footer [footerSize]byte
-	if _, err := source.ReadAt(footer[:], size-footerSize); err != nil {
+	if err := readAtFull(source, footer[:], size-footerSize); err != nil {
 		return nil, err
 	}
 	length := binary.LittleEndian.Uint64(footer[8:16])
@@ -227,7 +286,7 @@ func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, erro
 	}
 	metadata := make([]byte, int(length))
 	end := size - footerSize - int64(length)
-	if _, err := source.ReadAt(metadata, end); err != nil {
+	if err := readAtFull(source, metadata, end); err != nil {
 		return nil, err
 	}
 	h := sha256.Sum256(metadata)
@@ -241,10 +300,17 @@ func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, erro
 	if idx.Hash != expected.GetHashString() || idx.Size != expected.GetSizeBytes() || idx.Function != expected.GetDigestFunction().GetEnumValue() || idx.FrameSize < minimumFrameSize || idx.FrameSize > maximumFrameSize || len(idx.Frames) > maximumFrames {
 		return bad()
 	}
+	frameCount := int64(1)
+	if idx.Size > 0 {
+		frameCount += (idx.Size - 1) / int64(idx.FrameSize)
+	}
+	if int64(len(idx.Frames)) != frameCount {
+		return bad()
+	}
 	remaining := idx.Size
 	var offset int64
 	for _, f := range idx.Frames {
-		if remaining == 0 || f.Size != min(int64(idx.FrameSize), remaining) || f.Offset != offset || f.EncodedSize <= 0 || f.EncodedSize > encodedLimit(idx.FrameSize) || f.EncodedSize > end-offset {
+		if f.Size != min(int64(idx.FrameSize), remaining) || f.Offset != offset || f.EncodedSize <= 0 || f.EncodedSize > encodedLimit(idx.FrameSize) || f.EncodedSize > end-offset {
 			return bad()
 		}
 		if _, err := expected.GetDigestFunction().NewDigest(f.Hash, f.Size); err != nil {
@@ -284,7 +350,7 @@ func (r *Reader) ReadCompressedFrame(ctx context.Context, i int) ([]byte, error)
 	}
 	f := r.index.Frames[i]
 	data := make([]byte, int(f.EncodedSize))
-	if _, err := r.source.ReadAt(data, f.Offset); err != nil {
+	if err := readAtFull(r.source, data, f.Offset); err != nil {
 		return nil, err
 	}
 	h := sha256.Sum256(data)

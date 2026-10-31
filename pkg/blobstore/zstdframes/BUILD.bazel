@@ -17,6 +17,7 @@ go_library(
 go_test(
     name = "zstdframes_test",
     srcs = [
+        "representation_io_test.go",
         "representation_test.go",
         "transport_test.go",
     ],

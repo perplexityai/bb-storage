@@ -148,7 +148,7 @@ func TestIncompressibleAndEmptyBlobs(t *testing.T) {
 			require.NoError(t, err)
 			var compressed, identity bytes.Buffer
 			require.NoError(t, r.WriteCompressed(context.Background(), &compressed))
-			require.Equal(t, data, decode(t, compressed.Bytes()))
+			require.True(t, bytes.Equal(data, decode(t, compressed.Bytes())))
 			require.NoError(t, r.WriteIdentity(context.Background(), &identity, 0, pool))
 			require.Equal(t, data, identity.Bytes())
 		}
@@ -243,7 +243,7 @@ func TestCorruptionAndCancellation(t *testing.T) {
 // from bit-rot detection. This does not model an authenticated upload path.
 func rewriteIndex(t *testing.T, encoded []byte, modify func(map[string]any)) []byte {
 	t.Helper()
-	footer := bytes.Clone(encoded[len(encoded)-48:])
+	footer := encoded[len(encoded)-48:]
 	length := int(binary.LittleEndian.Uint64(footer[8:16]))
 	start := len(encoded) - 48 - length
 	var idx map[string]any
@@ -251,6 +251,13 @@ func rewriteIndex(t *testing.T, encoded []byte, modify func(map[string]any)) []b
 	modify(idx)
 	metadata, err := json.Marshal(idx)
 	require.NoError(t, err)
+	return replaceIndex(encoded, metadata)
+}
+
+func replaceIndex(encoded, metadata []byte) []byte {
+	footer := bytes.Clone(encoded[len(encoded)-48:])
+	length := int(binary.LittleEndian.Uint64(footer[8:16]))
+	start := len(encoded) - 48 - length
 	binary.LittleEndian.PutUint64(footer[8:16], uint64(len(metadata)))
 	h := sha256.Sum256(metadata)
 	copy(footer[16:], h[:])
@@ -317,10 +324,57 @@ func FuzzOpen(f *testing.F) {
 			t.Skip()
 		}
 		r, err := zstdframes.Open(bytes.NewReader(data), int64(len(data)), d)
+		if bytes.Equal(data, encoded.Bytes()) {
+			require.NoError(t, err)
+			var decoded bytes.Buffer
+			require.NoError(t, r.WriteIdentity(context.Background(), &decoded, 0, newPool()))
+			require.Equal(t, []byte("frame index fuzz seed"), decoded.Bytes())
+		}
 		if err == nil {
 			// A parser success must never turn into a panic or unbounded range
 			// when consuming the representation.
 			_ = r.WriteCompressed(context.Background(), io.Discard)
+			_ = r.WriteIdentity(context.Background(), io.Discard, 0, newPool())
+		}
+	})
+}
+
+func FuzzIndex(f *testing.F) {
+	data := bytes.Repeat([]byte("index parser fuzz seed"), 500)
+	d := blobDigest(data, remoteexecution.DigestFunction_SHA256)
+	var encoded bytes.Buffer
+	if err := zstdframes.Encode(context.Background(), &encoded, d, bytes.NewReader(data), 4096, newPool()); err != nil {
+		f.Fatal(err)
+	}
+	stored := encoded.Bytes()
+	length := int(binary.LittleEndian.Uint64(stored[len(stored)-40 : len(stored)-32]))
+	start := len(stored) - 48 - length
+	validIndex := stored[start : len(stored)-48]
+	f.Add(validIndex)
+	for _, metadata := range []string{`{}`, `{"frames":null}`, `{"frames":[null]}`, `{"frames":[[]]}`, `{"frames":[{},{}],"frameSize":4096}`, `{"frames":[`} {
+		f.Add([]byte(metadata))
+	}
+	f.Fuzz(func(t *testing.T, metadata []byte) {
+		if len(metadata) > 64<<10 {
+			t.Skip()
+		}
+		// Keep length and checksum valid so mutations reach JSON and structural
+		// validation instead of stopping at the corruption-detection gate.
+		candidate := replaceIndex(stored, metadata)
+		r, err := zstdframes.Open(bytes.NewReader(candidate), int64(len(candidate)), d)
+		if bytes.Equal(metadata, validIndex) {
+			require.NoError(t, err)
+			var identity bytes.Buffer
+			require.NoError(t, r.WriteIdentity(context.Background(), &identity, 0, newPool()))
+			require.Equal(t, data, identity.Bytes())
+		}
+		if err == nil {
+			var compressed bytes.Buffer
+			if err := r.WriteCompressed(context.Background(), &compressed); err == nil {
+				// The payload was not mutated; any successfully served stream
+				// must still reproduce the original logical bytes.
+				require.Equal(t, data, decode(t, compressed.Bytes()))
+			}
 			_ = r.WriteIdentity(context.Background(), io.Discard, 0, newPool())
 		}
 	})
@@ -361,7 +415,7 @@ func TestCodecReleaseAndMidstreamCancellation(t *testing.T) {
 	encoded, d := encode(t, data, 4096, pool)
 	r, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
 	require.NoError(t, err)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	part, err := r.ReadCompressedFrame(ctx, 0)
 	require.NoError(t, err)

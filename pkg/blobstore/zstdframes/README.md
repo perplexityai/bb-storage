@@ -13,6 +13,7 @@ logical CAS digest (hash and size of uncompressed bytes)
 
 `Encode` verifies the complete logical digest before writing the index and footer.
 The caller must use a temporary object, discard it on error, and publish it atomically only after successful completion and any required durability operations.
+Cancellation or a destination error can occur after the footer bytes have been written; a readable temporary object is not a substitute for a successful `Encode` result.
 The package neither owns files nor implements publication, eviction, disk quotas, or concurrent fill admission.
 
 `Open` validates the index against the expected logical digest.
@@ -26,7 +27,8 @@ Only locally generated representations from successful `Encode` calls may be pub
 Client-supplied indexes must never bypass logical content validation.
 An index associates logical chunks with compressed checksums based on that validation; compressed reads do not repeat logical validation by decoding.
 
-Frames range from 4 KiB to 4 MiB, with at most 65,536 frames and a 32 MiB serialized index.
+The configured logical frame size ranges from 4 KiB to 4 MiB; the last frame may be smaller, and an empty blob has one valid empty Zstandard frame.
+There are at most 65,536 frames and a 32 MiB serialized index.
 Encoded frame size is bounded separately, and the index parser bounds entry count before materializing the complete array.
 The entire logical blob is never buffered.
 These are format resource bounds, not the configurable CAS upload policy.
@@ -41,6 +43,8 @@ Readers and writers retain ownership of their I/O handles and must interrupt blo
 - Truncated, oversized, or incorrectly hashed uploads never produce a readable completed representation.
 - Corrupt frames are rejected before their bytes are returned; invalid index lengths, ranges, counts, and digests are rejected.
 - Cancellation and source, destination, and transport errors propagate.
+- Errors returned alongside final source bytes remain errors; full `ReaderAt` reads may return `EOF` without failing the transfer.
+- Separate fuzz targets exercise raw representations and mutated index metadata with recomputed checksums, so index parsing is not hidden behind the checksum gate.
 
 The transport fixtures are deliberately separate from the production server.
 They do not establish that its authorization, replication, retry, admission, or metrics decorators preserve this representation.
