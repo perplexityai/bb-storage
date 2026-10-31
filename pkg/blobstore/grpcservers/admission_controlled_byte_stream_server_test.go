@@ -76,7 +76,8 @@ func TestByteStreamReadAdmissionAcrossListeners(t *testing.T) {
 				started:           make(chan struct{}),
 			}
 			server, err := grpcservers.NewAdmissionControlledByteStreamServer(
-				grpcservers.NewByteStreamServer(storage, 64, bb_zstd.NewBoundedPool(1, 1, nil, nil)), testCase.limit, 1)
+				grpcservers.NewByteStreamServer(storage, 64, bb_zstd.NewBoundedPool(1, 1, nil, nil)), testCase.limit, 1,
+			)
 			require.NoError(t, err)
 			readFinished := make(chan struct{})
 			connA := newAdmissionTestConnection(t, server, grpc.StreamInterceptor(func(srv any, stream grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
@@ -189,7 +190,8 @@ func TestByteStreamWriteAdmissionBeforeFirstMessage(t *testing.T) {
 	defer cancel()
 	storage := &codecOrderStorage{written: make(chan []byte, 1)}
 	server, err := grpcservers.NewAdmissionControlledByteStreamServer(
-		grpcservers.NewByteStreamServer(storage, 64, bb_zstd.NewBoundedPool(1, 1, nil, nil)), 1, 1)
+		grpcservers.NewByteStreamServer(storage, 64, bb_zstd.NewBoundedPool(1, 1, nil, nil)), 1, 1,
+	)
 	require.NoError(t, err)
 	firstCtx, firstCancel := context.WithCancel(ctx)
 	defer firstCancel()
@@ -231,7 +233,8 @@ func TestByteStreamWriteAdmissionBeforeFirstMessage(t *testing.T) {
 func TestByteStreamAdmissionCanceledBeforeEntry(t *testing.T) {
 	backend := &admissionBackend{}
 	server, err := grpcservers.NewAdmissionControlledByteStreamServer(
-		grpcservers.NewByteStreamServer(backend, 64, bb_zstd.NewBoundedPool(1, 1, nil, nil)), 1, 1)
+		grpcservers.NewByteStreamServer(backend, 64, bb_zstd.NewBoundedPool(1, 1, nil, nil)), 1, 1,
+	)
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

@@ -196,7 +196,8 @@ func main() {
 			byteStreamServer = grpcservers.NewByteStreamServer(contentAddressableStorage, 1<<16, zstdPool)
 			if admission := configuration.ByteStreamAdmission; admission != nil {
 				byteStreamServer, err = grpcservers.NewAdmissionControlledByteStreamServer(
-					byteStreamServer, admission.MaximumConcurrentReads, admission.MaximumConcurrentWrites)
+					byteStreamServer, admission.MaximumConcurrentReads, admission.MaximumConcurrentWrites,
+				)
 				if err != nil {
 					return util.StatusWrap(err, "Failed to configure ByteStream admission")
 				}

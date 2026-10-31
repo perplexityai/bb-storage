@@ -92,7 +92,8 @@ func TestByteStreamEncoderWaitCancellation(t *testing.T) {
 			t.Cleanup(func() { require.NoError(t, occupied.Close()) })
 			backend := &admissionBackend{}
 			server, err := grpcservers.NewAdmissionControlledByteStreamServer(
-				grpcservers.NewByteStreamServer(backend, 64, pool), 1, 1)
+				grpcservers.NewByteStreamServer(backend, 64, pool), 1, 1,
+			)
 			require.NoError(t, err)
 			ctx, cancel := context.WithCancel(t.Context())
 			if cancellation == codes.DeadlineExceeded {
@@ -141,7 +142,8 @@ func TestByteStreamEncoderWaitCancellation(t *testing.T) {
 		pool := bb_zstd.NewBoundedPool(1, 1, nil, nil)
 		backend := &admissionBackend{err: status.Error(codes.NotFound, "missing blob")}
 		server, err := grpcservers.NewAdmissionControlledByteStreamServer(
-			grpcservers.NewByteStreamServer(backend, 64, pool), 1, 1)
+			grpcservers.NewByteStreamServer(backend, 64, pool), 1, 1,
+		)
 		require.NoError(t, err)
 		err = server.Read(&bytestream.ReadRequest{ResourceName: resourceName}, &admissionReadStream{ctx: t.Context()})
 		require.Equal(t, codes.NotFound, status.Code(err))
