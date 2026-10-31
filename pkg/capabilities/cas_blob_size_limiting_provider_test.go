@@ -2,13 +2,14 @@ package capabilities_test
 
 import (
 	"fmt"
+	"testing"
+
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-storage/pkg/capabilities"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
-	"testing"
 )
 
 func TestCASBlobSizeLimitingProvider(t *testing.T) {
