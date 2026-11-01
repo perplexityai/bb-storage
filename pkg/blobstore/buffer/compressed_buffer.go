@@ -207,11 +207,14 @@ type storedFrameReader struct {
 }
 
 func (r *storedFrameReader) Read() ([]byte, error) {
-	data, err := r.stored.index.ReadCompressedFrame(r.ctx, r.i)
-	if status.Code(err) == codes.OutOfRange {
+	if err := r.ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	if r.i == r.stored.index.FrameCount() {
 		r.source.notifyDataValid()
 		return nil, io.EOF
 	}
+	data, err := r.stored.index.ReadCompressedFrame(r.ctx, r.i)
 	if status.Code(err) == codes.DataLoss {
 		r.source.dataIntegrityCallback(false)
 	}

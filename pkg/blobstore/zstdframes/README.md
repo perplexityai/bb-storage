@@ -108,6 +108,10 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
 - Retrying a disconnected source resumes at the logical offset with another
   compressed encoding, without holding the encoder during source replacement.
 - Failed uploads release staging resources; copying to raw storage stays logical.
+- Explicit truncated-stream errors and errors accompanying a full chunk remain
+  failures; storage `OutOfRange` errors are not interpreted as frame exhaustion.
+- Fallback replication releases the failed decoder before acquiring its
+  replacement, including streamed identity and compressed reads.
 
 Format tests additionally cover reopened files, concurrent frame reads, malformed
 metadata, truncation, cancellation, and source/destination errors. Mixed compressed
@@ -122,3 +126,8 @@ confirmed `ByteStream.Read` with no `BatchReadBlobs` call; the artifact exceeded
 the configured 4 MiB batch size. The same probe rejected an oversized cache
 upload without failing the local build or publishing an incomplete Action Cache
 entry. This does not establish compatibility with every remote-execution worker.
+
+A persistent-daemon restart check also verifies mixed raw and compressed records:
+write raw data, restart with compression enabled, write compressed data, then
+restart again and reconstruct both through identity and compressed reads. This
+covers graceful restart, not abrupt-power-loss durability.

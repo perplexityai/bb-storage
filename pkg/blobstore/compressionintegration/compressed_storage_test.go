@@ -20,6 +20,8 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore/configuration"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/grpcclients"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/grpcservers"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/readfallback"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/replication"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/sharding"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
 	"github.com/buildbarn/bb-storage/pkg/capabilities"
@@ -380,4 +382,143 @@ func TestCompressedReadRetriesInLogicalSpaceWithoutHoldingEncoder(t *testing.T) 
 	require.Equal(t, data, actual)
 	require.EqualValues(t, 1, source.retries.Load())
 	require.EqualValues(t, 1, source.done.Load())
+}
+
+type frameReadFailure struct {
+	*bytes.Reader
+	err    error
+	closed int
+}
+
+func (r *frameReadFailure) ReadAt(p []byte, off int64) (int, error) {
+	if off == 0 {
+		return 0, r.err
+	}
+	return r.Reader.ReadAt(p, off)
+}
+func (r *frameReadFailure) Close() error { r.closed++; return nil }
+
+func TestCompressedReadPreservesStorageErrors(t *testing.T) {
+	p := pool()
+	data := bytes.Repeat([]byte("encoded integrity"), 100)
+	d := digestOf(data)
+	var encoded bytes.Buffer
+	require.NoError(t, zstdframes.Encode(t.Context(), &encoded, d, bytes.NewReader(data), 1<<20, p))
+	for _, failure := range []error{io.ErrUnexpectedEOF, status.Error(codes.OutOfRange, "device read outside range")} {
+		t.Run(failure.Error(), func(t *testing.T) {
+			backing := &frameReadFailure{Reader: bytes.NewReader(encoded.Bytes()), err: failure}
+			var valid bool
+			b := blobstore.NewCompressedCASReadBufferFactory(p).NewBufferFromReaderAt(d, backing, int64(encoded.Len()), func(v bool) { valid = v })
+			r, ok := buffer.ZSTDChunkReader(b, 4096)
+			require.True(t, ok)
+			_, err := r.Read()
+			r.Close()
+			require.ErrorIs(t, err, failure, "a storage error must not become successful end-of-stream")
+			require.False(t, valid, "failed reads must not mark the record valid")
+			require.Equal(t, 1, backing.closed)
+		})
+	}
+}
+
+func TestTruncatedCompressedSourceFailsLogicalReads(t *testing.T) {
+	data := make([]byte, 10000)
+	rng := rand.New(rand.NewPCG(17, 29))
+	for i := range data {
+		data[i] = byte(rng.Uint32())
+	}
+	d := digestOf(data)
+	encoder, err := zstd.NewWriter(nil)
+	require.NoError(t, err)
+	encoded := encoder.EncodeAll(data, nil)
+	require.NoError(t, encoder.Close())
+	p := pool()
+	for _, cut := range []int{1, 3, 10, len(encoded) / 2} {
+		t.Run(fmt.Sprint(cut), func(t *testing.T) {
+			b := buffer.NewCASBufferFromZSTDReader(t.Context(), d, io.NopCloser(bytes.NewReader(encoded[:len(encoded)-cut])), p, buffer.BackendProvided(buffer.Irreparable(d)))
+			r := b.ToChunkReader(0, 64)
+			var err error
+			for err == nil {
+				_, err = r.Read()
+			}
+			r.Close()
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+		})
+	}
+}
+
+type terminalBytesReader struct {
+	data  []byte
+	err   error
+	reads int
+}
+
+func (r *terminalBytesReader) Read(p []byte) (int, error) {
+	r.reads++
+	if len(r.data) == 0 {
+		return 0, io.EOF
+	}
+	n := copy(p, r.data)
+	r.data = r.data[n:]
+	return n, r.err
+}
+func (*terminalBytesReader) Close() error { return nil }
+
+func TestEncodedReadPreservesFullChunkTerminalStatus(t *testing.T) {
+	for _, terminal := range []error{io.EOF, status.Error(codes.Unavailable, "backend failed with final bytes")} {
+		t.Run(terminal.Error(), func(t *testing.T) {
+			p := pool()
+			data := []byte("payload")
+			source := &terminalBytesReader{data: data, err: terminal}
+			b := buffer.NewCASBufferFromZSTDReader(t.Context(), digestOf(data), source, p, buffer.BackendProvided(buffer.Irreparable(digestOf(data))))
+			r, ok := buffer.ZSTDChunkReader(b, len(data))
+			require.True(t, ok)
+			defer r.Close()
+			chunk, err := r.Read()
+			require.NoError(t, err)
+			require.Equal(t, data, chunk)
+			_, err = r.Read()
+			require.ErrorIs(t, err, terminal)
+			require.Equal(t, 1, source.reads, "a terminal source must not be resumed")
+		})
+	}
+}
+
+func TestReadFallbackReleasesFailedDecoderBeforeReplication(t *testing.T) {
+	primaryPool, secondaryPool, clientPool := pool(), pool(), pool()
+	primary, _, _ := localStorage(t, primaryPool)
+	secondary, _, _ := localStorage(t, secondaryPool)
+	primaryClient := grpcclients.NewCASBlobAccess(serve(t, primary, primaryPool), uuid.NewRandom, 4096, clientPool)
+	secondaryClient := grpcclients.NewCASBlobAccess(serve(t, secondary, secondaryPool), uuid.NewRandom, 4096, clientPool)
+	replicator := replication.NewLocalBlobReplicator(secondaryClient, primaryClient)
+	fallback := readfallback.NewReadFallbackBlobAccess(primaryClient, secondaryClient, replicator, replicator)
+	frontend := serve(t, fallback, clientPool)
+	for _, mode := range []string{"writer", "identity", "compressed"} {
+		t.Run(mode, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+			defer cancel()
+			data := bytes.Repeat([]byte(mode), 100)
+			d := digestOf(data)
+			require.NoError(t, secondary.Put(ctx, d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided)))
+			var got []byte
+			switch mode {
+			case "writer":
+				var out bytes.Buffer
+				require.NoError(t, fallback.Get(ctx, d).IntoWriter(&out))
+				got = out.Bytes()
+			case "identity":
+				got = read(t, ctx, frontend, d, remoteexecution.Compressor_IDENTITY, 0)
+			case "compressed":
+				encoded := read(t, ctx, frontend, d, remoteexecution.Compressor_ZSTD, 0)
+				decoder, err := zstd.NewReader(nil)
+				require.NoError(t, err)
+				defer decoder.Close()
+				got, err = decoder.DecodeAll(encoded, nil)
+				require.NoError(t, err)
+			}
+			require.Equal(t, data, got)
+			copied, err := primary.Get(ctx, d).ToByteSlice(len(data))
+			require.NoError(t, err)
+			require.Equal(t, data, copied)
+		})
+	}
 }

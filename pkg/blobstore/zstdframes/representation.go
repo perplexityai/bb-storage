@@ -358,6 +358,9 @@ func (r *Reader) WriteRepresentation(ctx context.Context, dst io.Writer) error {
 	return writeWithContext(ctx, dst, r.footer[:])
 }
 
+// FrameCount returns the number of independently readable frames.
+func (r *Reader) FrameCount() int { return len(r.index.Frames) }
+
 // FrameDigests returns a copy of the ordered logical chunk mapping. The
 // mapping describes fixed-size frames, not a content-defined chunking scheme.
 func (r *Reader) FrameDigests() []digest.Digest {
