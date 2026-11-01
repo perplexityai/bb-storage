@@ -4,7 +4,6 @@ import (
 	"context"
 	"io"
 	"slices"
-	"sync"
 	"sync/atomic"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
@@ -18,9 +17,7 @@ import (
 
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 type casBlobAccess struct {
@@ -72,44 +69,6 @@ func (r *byteStreamChunkReader) Close() {
 			break
 		}
 	}
-}
-
-// zstdByteStreamChunkReader reads compressed data from a gRPC stream
-// and decompresses it using a pooled decoder.
-type zstdByteStreamChunkReader struct {
-	client        bytestream.ByteStream_ReadClient
-	cancel        context.CancelFunc
-	decoder       bb_zstd.Decoder
-	pipeReader    *io.PipeReader
-	readChunkSize int
-	wg            sync.WaitGroup
-}
-
-func (r *zstdByteStreamChunkReader) Read() ([]byte, error) {
-	buf := make([]byte, r.readChunkSize)
-	n, err := r.decoder.Read(buf)
-	if n > 0 {
-		if err != nil && err != io.EOF {
-			err = nil
-		}
-		return buf[:n], err
-	}
-	return nil, err
-}
-
-func (r *zstdByteStreamChunkReader) Close() {
-	r.decoder.Close()
-
-	r.pipeReader.Close()
-	r.cancel()
-
-	// Drain the gRPC stream.
-	for {
-		if _, err := r.client.Recv(); err != nil {
-			break
-		}
-	}
-	r.wg.Wait()
 }
 
 type zstdByteStreamWriter struct {
@@ -193,43 +152,9 @@ func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.B
 	}
 
 	if useCompression {
-		pipeReader, pipeWriter := io.Pipe()
-
-		r := &zstdByteStreamChunkReader{
-			client:        client,
-			cancel:        cancel,
-			pipeReader:    pipeReader,
-			readChunkSize: ba.readChunkSize,
-		}
-
-		// Start goroutine to read from gRPC and write to pipe.
-		r.wg.Add(1)
-		go func() {
-			defer r.wg.Done()
-			defer pipeWriter.Close()
-			for {
-				chunk, err := client.Recv()
-				if err != nil {
-					if err != io.EOF {
-						pipeWriter.CloseWithError(err)
-					}
-					return
-				}
-				if _, writeErr := pipeWriter.Write(chunk.Data); writeErr != nil {
-					return
-				}
-			}
-		}()
-
-		decoder, err := ba.zstdPool.NewDecoder(ctx, pipeReader)
-		if err != nil {
-			pipeReader.CloseWithError(err)
-			cancel()
-			return buffer.NewBufferFromError(err)
-		}
-		r.decoder = decoder
-
-		return buffer.NewCASBufferFromChunkReader(digest, r, buffer.BackendProvided(buffer.Irreparable(digest)))
+		return buffer.NewCASBufferFromZSTDReader(ctx, digest,
+			buffer.NewReaderFromChunkReader(&byteStreamChunkReader{client: client, cancel: cancel}),
+			ba.zstdPool, buffer.BackendProvided(buffer.Irreparable(digest)))
 	}
 
 	return buffer.NewCASBufferFromChunkReader(digest, &byteStreamChunkReader{
@@ -274,25 +199,15 @@ func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer
 			cancel:       cancel,
 		}
 
-		// Acquire encoder from pool (blocks if at capacity — provides backpressure).
-		encoder, err := ba.zstdPool.NewEncoder(ctx, byteStreamWriter)
-		if err != nil {
+		r := b.ToReader()
+		copyErr := bb_zstd.Copy(ctx, ba.zstdPool, byteStreamWriter, r)
+		closeErr := r.Close()
+		if copyErr == nil {
+			copyErr = closeErr
+		}
+		if err := copyErr; err != nil {
 			cancel()
-			b.Discard()
-			if _, closeErr := client.CloseAndRecv(); closeErr != nil {
-				return status.Errorf(codes.Internal, "Failed to close client: %v and acquire encoder: %v", closeErr, err)
-			}
-			return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD encoder: %v", err)
-		}
-
-		if err := b.IntoWriter(encoder); err != nil {
-			encoder.Close()
-			byteStreamWriter.Close()
-			return err
-		}
-
-		if err := encoder.Close(); err != nil {
-			byteStreamWriter.Close()
+			client.CloseAndRecv()
 			return err
 		}
 

@@ -24,9 +24,13 @@ func newReaderBackedChunkReader(r io.ReadCloser, maximumChunkSizeBytes int) Chun
 func (r *readerBackedChunkReader) Read() ([]byte, error) {
 	if r.err == nil {
 		b := make([]byte, r.maximumChunkSizeBytes)
-		n, err := io.ReadFull(r.r, b[:])
-		if err == io.ErrUnexpectedEOF {
-			r.err = io.EOF
+		source := terminalErrorReader{Reader: r.r}
+		n, err := io.ReadFull(&source, b[:])
+		// ReadFull may synthesize UnexpectedEOF from a short clean read, or
+		// suppress an error returned alongside a full chunk. Preserve actual
+		// source failures, including truncated compressed streams.
+		if source.err != nil {
+			r.err = source.err
 		} else {
 			r.err = err
 		}
@@ -35,6 +39,17 @@ func (r *readerBackedChunkReader) Read() ([]byte, error) {
 		}
 	}
 	return nil, r.err
+}
+
+type terminalErrorReader struct {
+	io.Reader
+	err error
+}
+
+func (r *terminalErrorReader) Read(p []byte) (int, error) {
+	n, err := r.Reader.Read(p)
+	r.err = err
+	return n, err
 }
 
 func (r *readerBackedChunkReader) Close() {

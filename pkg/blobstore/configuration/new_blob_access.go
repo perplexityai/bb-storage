@@ -150,6 +150,15 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			DigestKeyFormat: backendA.DigestKeyFormat.Combine(backendB.DigestKeyFormat),
 		}, "mirrored", nil
 	case *pb.BlobAccessConfiguration_Local:
+		compression := backend.Local.CasCompression
+		var compressionPool bb_zstd.Pool
+		if compression != nil {
+			casCreator, ok := creator.(*casBlobAccessCreator)
+			if !ok || backend.Local.GetBlocksOnBlockDevice() == nil {
+				return BlobAccessInfo{}, "", status.Error(codes.InvalidArgument, "CAS compression requires block-device CAS storage")
+			}
+			compressionPool = casCreator.zstdPool
+		}
 		digestKeyFormat := digest.KeyWithInstance
 		if !backend.Local.HierarchicalInstanceNames {
 			digestKeyFormat = creator.GetBaseDigestKeyFormat()
@@ -200,9 +209,14 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 				return BlobAccessInfo{}, "", status.Errorf(codes.InvalidArgument, "Block device only has %d sectors (%d bytes each), which is less than the total number of blocks (%d), meaning this backend would be incapable of storing any data", sectorCount, sectorSizeBytes, blockCount)
 			}
 
-			cachedReadBufferFactory, err := newCachedReadBufferFactory(blocksOnBlockDevice.DataIntegrityValidationCache, readBufferFactory, digestKeyFormat)
-			if err != nil {
-				return BlobAccessInfo{}, "", err
+			var cachedReadBufferFactory blobstore.ReadBufferFactory
+			if compression != nil {
+				cachedReadBufferFactory = blobstore.NewCompressedCASReadBufferFactory(compressionPool)
+			} else {
+				cachedReadBufferFactory, err = newCachedReadBufferFactory(blocksOnBlockDevice.DataIntegrityValidationCache, readBufferFactory, digestKeyFormat)
+				if err != nil {
+					return BlobAccessInfo{}, "", err
+				}
 			}
 
 			blockAllocator = local.NewBlockDeviceBackedBlockAllocator(
@@ -367,6 +381,12 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 				storageTypeName,
 				creator.GetDefaultCapabilitiesProvider(),
 			)
+		}
+		if compression != nil {
+			localBlobAccess, err = blobstore.NewCompressedCASBlobAccess(localBlobAccess, compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, compressionPool)
+			if err != nil {
+				return BlobAccessInfo{}, "", err
+			}
 		}
 		return BlobAccessInfo{
 			BlobAccess:      localBlobAccess,

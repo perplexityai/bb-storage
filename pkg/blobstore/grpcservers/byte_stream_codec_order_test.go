@@ -99,6 +99,11 @@ func (s *codecOrderWriteStream) SendAndClose(response *bytestream.WriteResponse)
 }
 
 func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
+	t.Run("offset_read", func(t *testing.T) { testMixedCodecOrder(t, false) })
+	t.Run("copy", func(t *testing.T) { testMixedCodecOrder(t, true) })
+}
+
+func testMixedCodecOrder(t *testing.T, copyBlob bool) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	encoderOptions := []zstd.EOption{zstd.WithEncoderConcurrency(1)}
@@ -107,7 +112,7 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	frontendPool := &heldWriteDecoderPool{Pool: shared, acquired: make(chan struct{}), proceed: make(chan struct{})}
 	backendPool := &observedReadDecoderPool{Pool: shared, attempted: make(chan struct{})}
 
-	storage := &codecOrderStorage{written: make(chan []byte, 1)}
+	storage := &codecOrderStorage{written: make(chan []byte, 2)}
 	listener := bufconn.Listen(1 << 20)
 	storageServer := grpc.NewServer()
 	bytestream.RegisterByteStreamServer(storageServer, grpcservers.NewByteStreamServer(storage, 64,
@@ -152,8 +157,14 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	readStream := &admissionReadStream{ctx: ctx}
 	readDone := make(chan error, 1)
 	go func() {
+		if copyBlob {
+			readDone <- backend.Put(ctx, blobDigest, backend.Get(ctx, blobDigest))
+			return
+		}
 		readDone <- frontend.Read(&bytestream.ReadRequest{
 			ResourceName: blobDigest.GetByteStreamReadPath(remoteexecution.Compressor_ZSTD),
+			// A logical offset requires decoding; full reads now pass through.
+			ReadOffset: 1,
 		}, readStream)
 	}()
 	select {
@@ -184,10 +195,13 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("upload did not reach storage")
 	}
+	if copyBlob {
+		return
+	}
 	decoder, err := zstd.NewReader(nil)
 	require.NoError(t, err)
 	defer decoder.Close()
 	decoded, err := decoder.DecodeAll(readStream.data.Bytes(), nil)
 	require.NoError(t, err)
-	require.Equal(t, []byte("hello"), decoded)
+	require.Equal(t, []byte("ello"), decoded)
 }

@@ -124,3 +124,5 @@ func (eh shardKeyAddingErrorHandler) OnError(err error) (buffer.Buffer, error) {
 }
 
 func (shardKeyAddingErrorHandler) Done() {}
+
+func (shardKeyAddingErrorHandler) NonRetrying() {}

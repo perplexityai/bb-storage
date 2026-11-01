@@ -14,6 +14,7 @@ go_library(
         "chunk_reader.go",
         "chunk_reader_backed_reader.go",
         "common_conversions.go",
+        "compressed_buffer.go",
         "discard.go",
         "error_buffer.go",
         "error_chunk_reader.go",
@@ -33,8 +34,10 @@ go_library(
     importpath = "github.com/buildbarn/bb-storage/pkg/blobstore/buffer",
     visibility = ["//visibility:public"],
     deps = [
+        "//pkg/blobstore/zstdframes",
         "//pkg/digest",
         "//pkg/util",
+        "//pkg/zstd",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",
         "@org_golang_google_protobuf//proto",
