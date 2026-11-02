@@ -5,6 +5,7 @@ go_test(
     srcs = [
         "compressed_storage_test.go",
         "compressed_upload_test.go",
+        "review_regression_test.go",
     ],
     deps = [
         "//pkg/auth",
@@ -13,6 +14,7 @@ go_test(
         "//pkg/blobstore/configuration",
         "//pkg/blobstore/grpcclients",
         "//pkg/blobstore/grpcservers",
+        "//pkg/blobstore/local",
         "//pkg/blobstore/readfallback",
         "//pkg/blobstore/replication",
         "//pkg/blobstore/sharding",
@@ -20,7 +22,9 @@ go_test(
         "//pkg/capabilities",
         "//pkg/clock",
         "//pkg/digest",
+        "//pkg/lossymap",
         "//pkg/proto/configuration/blobstore",
+        "//pkg/util",
         "//pkg/zstd",
         "@bazel_remote_apis//build/bazel/remote/execution/v2:remote_execution_go_proto",
         "@com_github_google_uuid//:uuid",

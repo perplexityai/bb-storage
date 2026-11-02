@@ -33,9 +33,10 @@ non-CAS storage do not support this option. Absent configuration retains raw
 storage. To forward compressed reads across a frontend's internal gRPC hop, also
 set that backend's `grpc.enableCompression` and advertise `ZSTD` at the servers.
 
-Already-present blobs skip upload consumption and codec acquisition inside the
-authorized storage Put path. For new blobs, the wrapper reserves one write slot and a
-conservative bound on staging bytes: worst-case encoded frame expansion plus a
+Already-present blobs skip encoded upload consumption and codec acquisition
+inside the authorized storage Put path, while preserving close and background-task
+errors. Inputs without a safe skip path are consumed without being stored again.
+For new blobs, the wrapper reserves one write slot and a conservative bound on staging bytes: worst-case encoded frame expansion plus a
 32 MiB index allowance. Excess work fails with `RESOURCE_EXHAUSTED`. An unlinked
 temporary file receives the representation; errors, cancellation, and process
 exit reclaim it. Validation must finish successfully before the existing local
@@ -102,7 +103,9 @@ limit. Incompressible and tiny records may occupy more space than raw data.
 
 `Reader` supports concurrent frame reads when its immutable backing `ReaderAt`
 does. Its owner must keep that backing object alive through all readers. The local
-buffer implementation pins block references across clones and refreshes.
+buffer implementation pins block references across clones and refreshes. Opening
+and validating the index is deferred until consumption, outside the local store
+metadata lock; construction, size queries, and cloning do not read the device.
 
 ## Verification
 
@@ -121,6 +124,10 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
   limits are enforced with compressed and identity-only internal hops.
 - Source failures cancel backend codec waits promptly; early backend completion
   cannot hide deferred local task errors.
+- A blocked index read permits unrelated writes to complete. Lazy clones retain
+  their record until the final consumer releases it.
+- Known backend acquisition errors propagate before waiting for decoder capacity.
+- Local duplicate uploads retain source-close and background-task errors.
 - Denied instances, corrupt frames/indexes, and invalid uploads fail correctly.
 - Retrying a disconnected source resumes at the logical offset with another
   compressed encoding, without holding the encoder during source replacement.

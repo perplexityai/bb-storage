@@ -129,7 +129,13 @@ func NewCASBufferFromZSTDUpload(ctx context.Context, d digest.Digest, r io.ReadC
 func ZSTDUploadReader(b Buffer) (io.ReadCloser, bool) {
 	switch b := b.(type) {
 	case *compressedBuffer:
-		return b.encodedReader(), true
+		r, err := b.encodedReader()
+		if err != nil {
+			return newErrorReader(err), true
+		}
+		return r, true
+	case *deferredCASBuffer:
+		return ZSTDUploadReader(b.resolve())
 	case *casBufferWithBackgroundTask:
 		if r, ok := ZSTDUploadReader(b.base); ok {
 			return b.decorateReader(r), true
@@ -150,6 +156,11 @@ func NewCASBufferFromZSTDRepresentation(d digest.Digest, r ReadAtCloser, size in
 // acquired its block reference. Call before consuming or sharing the buffer.
 func WithZSTDContext(b Buffer, ctx context.Context) Buffer {
 	switch b := b.(type) {
+	case *deferredCASBuffer:
+		b.ctx = ctx
+		if b.resolved != nil {
+			WithZSTDContext(b.resolved, ctx)
+		}
 	case *compressedBuffer:
 		b.ctx = ctx
 	case *casBufferWithBackgroundTask:
@@ -160,22 +171,21 @@ func WithZSTDContext(b Buffer, ctx context.Context) Buffer {
 	return b
 }
 
-func (b *compressedBuffer) encodedReader() io.ReadCloser {
+func (b *compressedBuffer) encodedReader() (io.ReadCloser, error) {
 	if b.readEncoded != nil {
-		r, err := b.readEncoded(0)
-		if err != nil {
-			return newErrorReader(err)
-		}
-		return r
+		return b.readEncoded(0)
 	}
 	if b.stored == nil {
-		return b.encoded
+		return b.encoded, nil
 	}
-	return newChunkReaderBackedReader(&storedFrameReader{ctx: b.ctx, stored: b.stored, source: b.source})
+	return newChunkReaderBackedReader(&storedFrameReader{ctx: b.ctx, stored: b.stored, source: b.source}), nil
 }
 
 func (b *compressedBuffer) logical() Buffer {
-	r := b.encodedReader()
+	r, err := b.encodedReader()
+	if err != nil {
+		return NewBufferFromError(err)
+	}
 	decoded, err := zstd.NewReadCloser(b.ctx, b.pool, r)
 	if err != nil {
 		r.Close()
@@ -261,7 +271,11 @@ func (b *compressedBuffer) zstdChunkReaderAt(offset int64, limit int) (ChunkRead
 		return newReaderBackedChunkReader(r, limit), true
 	}
 	if offset == 0 {
-		return newReaderBackedChunkReader(b.encodedReader(), limit), true
+		r, err := b.encodedReader()
+		if err != nil {
+			return newErrorChunkReader(err), true
+		}
+		return newReaderBackedChunkReader(r, limit), true
 	}
 	if b.stored != nil {
 		return newReaderBackedChunkReader(newChunkReaderBackedReader(&storedSuffixReader{buffer: b, offset: offset, compressed: true}), limit), true
@@ -327,6 +341,9 @@ func (r *storedFrameReader) Close() { r.stored.release() }
 // record with its existing physical size. Never use for an ordinary Put, whose
 // destination may use a different representation.
 func ForLocalRefresh(b Buffer) Buffer {
+	if d, ok := b.(*deferredCASBuffer); ok {
+		return ForLocalRefresh(d.resolve())
+	}
 	if c, ok := b.(*compressedBuffer); ok && c.stored != nil {
 		return &representationCopyBuffer{Buffer: NewValidatedBufferFromReaderAt(&storedReference{c.stored}, c.stored.size), original: c}
 	}

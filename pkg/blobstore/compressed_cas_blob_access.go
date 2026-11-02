@@ -61,9 +61,12 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	// This runs inside Put, after any upload authorization. Checking in the
 	// protocol handler via FindMissing would instead apply read-side policy.
 	missing, err := ba.BlobAccess.FindMissing(ctx, d.ToSingletonSet())
-	if err != nil || missing.Length() == 0 {
+	if err != nil {
 		b.Discard()
 		return err
+	}
+	if missing.Empty() {
+		return buffer.SkipUpload(b)
 	}
 
 	reservation, err := zstdframes.MaximumStoredSize(d.GetSizeBytes(), storedFrameSize)
@@ -145,18 +148,20 @@ func NewCompressedCASReadBufferFactory(pool zstd.Pool) ReadBufferFactory {
 }
 
 func (f *compressedCASReadBufferFactory) NewBufferFromReaderAt(d digest.Digest, r buffer.ReadAtCloser, size int64, callback buffer.DataIntegrityCallback) buffer.Buffer {
-	index, err := zstdframes.Open(r, size, d)
-	if err == nil {
-		return buffer.NewCASBufferFromZSTDRepresentation(d, r, size, index, f.pool, buffer.BackendProvided(callback))
-	}
-	if size == d.GetSizeBytes() {
-		// A raw blob may happen to end in format-like bytes. Only full logical
-		// validation can accept the legacy interpretation of such a record.
-		return CASReadBufferFactory.NewBufferFromReaderAt(d, r, size, callback)
-	}
-	r.Close()
-	callback(false)
-	return buffer.NewBufferFromError(err)
+	return buffer.NewCASBufferFromDeferredReaderAt(d, r, buffer.BackendProvided(callback), func(r buffer.ReadAtCloser) buffer.Buffer {
+		index, err := zstdframes.Open(r, size, d)
+		if err == nil {
+			return buffer.NewCASBufferFromZSTDRepresentation(d, r, size, index, f.pool, buffer.BackendProvided(callback))
+		}
+		if size == d.GetSizeBytes() {
+			// A raw blob may happen to end in format-like bytes. Only full logical
+			// validation can accept the legacy interpretation of such a record.
+			return CASReadBufferFactory.NewBufferFromReaderAt(d, r, size, callback)
+		}
+		r.Close()
+		callback(false)
+		return buffer.NewBufferFromError(err)
+	})
 }
 
 func (f *compressedCASReadBufferFactory) NewBufferFromByteSlice(d digest.Digest, p []byte, callback buffer.DataIntegrityCallback) buffer.Buffer {
