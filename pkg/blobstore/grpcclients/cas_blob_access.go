@@ -75,6 +75,7 @@ type zstdByteStreamWriter struct {
 	client       bytestream.ByteStream_WriteClient
 	resourceName string
 	writeOffset  int64
+	sendError    error
 	cancel       context.CancelFunc
 }
 
@@ -84,6 +85,7 @@ func (w *zstdByteStreamWriter) Write(p []byte) (int, error) {
 		WriteOffset:  w.writeOffset,
 		Data:         p,
 	}); err != nil {
+		w.sendError = err
 		return 0, err
 	}
 	w.writeOffset += int64(len(p))
@@ -92,17 +94,17 @@ func (w *zstdByteStreamWriter) Write(p []byte) (int, error) {
 }
 
 func (w *zstdByteStreamWriter) Close() error {
-	if err := w.client.Send(&bytestream.WriteRequest{
-		ResourceName: w.resourceName,
-		WriteOffset:  w.writeOffset,
-		FinishWrite:  true,
-	}); err != nil {
-		w.cancel()
-		w.client.CloseAndRecv()
-		return err
+	defer w.cancel()
+	if w.sendError == nil {
+		// Send may return EOF because the server already accepted an existing
+		// blob. Receive its result before canceling the RPC.
+		w.client.Send(&bytestream.WriteRequest{
+			ResourceName: w.resourceName,
+			WriteOffset:  w.writeOffset,
+			FinishWrite:  true,
+		})
 	}
 	_, err := w.client.CloseAndRecv()
-	w.cancel()
 	return err
 }
 
@@ -133,13 +135,22 @@ func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.B
 		return buffer.NewBufferFromError(err)
 	}
 
-	compressor := remoteexecution.Compressor_IDENTITY
 	if useCompression {
-		compressor = remoteexecution.Compressor_ZSTD
+		return buffer.NewCASBufferFromZSTDReadFactory(ctx, digest, func(offset int64) (io.ReadCloser, error) {
+			ctxWithCancel, cancel := context.WithCancel(ctx)
+			resourceName := digest.GetByteStreamReadPath(remoteexecution.Compressor_ZSTD)
+			client, err := ba.byteStreamClient.Read(metadata.AppendToOutgoingContext(ctxWithCancel, resourceNameHeader, resourceName),
+				&bytestream.ReadRequest{ResourceName: resourceName, ReadOffset: offset})
+			if err != nil {
+				cancel()
+				return nil, err
+			}
+			return buffer.NewReaderFromChunkReader(&byteStreamChunkReader{client: client, cancel: cancel}), nil
+		}, ba.zstdPool, buffer.BackendProvided(buffer.Irreparable(digest)))
 	}
 
 	ctxWithCancel, cancel := context.WithCancel(ctx)
-	resourceName := digest.GetByteStreamReadPath(compressor)
+	resourceName := digest.GetByteStreamReadPath(remoteexecution.Compressor_IDENTITY)
 	client, err := ba.byteStreamClient.Read(
 		metadata.AppendToOutgoingContext(ctxWithCancel, resourceNameHeader, resourceName),
 		&bytestream.ReadRequest{
@@ -149,12 +160,6 @@ func (ba *casBlobAccess) Get(ctx context.Context, digest digest.Digest) buffer.B
 	if err != nil {
 		cancel()
 		return buffer.NewBufferFromError(err)
-	}
-
-	if useCompression {
-		return buffer.NewCASBufferFromZSTDReader(ctx, digest,
-			buffer.NewReaderFromChunkReader(&byteStreamChunkReader{client: client, cancel: cancel}),
-			ba.zstdPool, buffer.BackendProvided(buffer.Irreparable(digest)))
 	}
 
 	return buffer.NewCASBufferFromChunkReader(digest, &byteStreamChunkReader{
@@ -199,16 +204,31 @@ func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer
 			cancel:       cancel,
 		}
 
-		r := b.ToReader()
-		copyErr := bb_zstd.Copy(ctx, ba.zstdPool, byteStreamWriter, r)
+		r, encoded := buffer.ZSTDUploadReader(b)
+		var copyErr error
+		if encoded {
+			_, copyErr = io.CopyBuffer(byteStreamWriter, r, make([]byte, ba.readChunkSize))
+		} else {
+			r = b.ToReader()
+			copyErr = bb_zstd.Copy(ctx, ba.zstdPool, byteStreamWriter, r)
+		}
 		closeErr := r.Close()
+		if byteStreamWriter.sendError != nil {
+			remoteErr := byteStreamWriter.Close()
+			if closeErr != nil {
+				return closeErr
+			}
+			return remoteErr
+		}
 		if copyErr == nil {
 			copyErr = closeErr
 		}
-		if err := copyErr; err != nil {
+		if copyErr != nil {
+			// A source failure must also interrupt backend codec/admission waits.
+			// Closing only the send side cannot cancel those waits.
 			cancel()
 			client.CloseAndRecv()
-			return err
+			return copyErr
 		}
 
 		return byteStreamWriter.Close()
@@ -227,8 +247,8 @@ func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer
 				WriteOffset:  writeOffset,
 				Data:         data,
 			}) != nil {
-				cancel()
 				_, err := client.CloseAndRecv()
+				cancel()
 				return err
 			}
 			writeOffset += int64(len(data))
@@ -240,8 +260,8 @@ func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer
 				WriteOffset:  writeOffset,
 				FinishWrite:  true,
 			}) != nil {
-				cancel()
 				_, err := client.CloseAndRecv()
+				cancel()
 				return err
 			}
 			_, err := client.CloseAndRecv()

@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_test")
 
 go_test(
     name = "compressionintegration_test",
-    srcs = ["compressed_storage_test.go"],
+    srcs = [
+        "compressed_storage_test.go",
+        "compressed_upload_test.go",
+    ],
     deps = [
         "//pkg/auth",
         "//pkg/blobstore",

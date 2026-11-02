@@ -92,9 +92,16 @@ func localStorageMode(t *testing.T, p *observedPool, compressed, hierarchical bo
 
 func serve(t *testing.T, ba blobstore.BlobAccess, p bb_zstd.Pool) *grpc.ClientConn {
 	t.Helper()
+	return serveWithLimit(t, ba, p, 0)
+}
+
+func serveWithLimit(t *testing.T, ba blobstore.BlobAccess, p bb_zstd.Pool, limit int64) *grpc.ClientConn {
+	t.Helper()
 	listener := bufconn.Listen(64 << 10)
 	s := grpc.NewServer()
-	bytestream.RegisterByteStreamServer(s, grpcservers.NewByteStreamServer(ba, 4096, p))
+	server, err := grpcservers.NewByteStreamServerWithMaximumBlobSize(ba, 4096, p, limit)
+	require.NoError(t, err)
+	bytestream.RegisterByteStreamServer(s, server)
 	remoteexecution.RegisterContentAddressableStorageServer(s, grpcservers.NewContentAddressableStorageServer(ba, 4<<20))
 	remoteexecution.RegisterCapabilitiesServer(s, capabilities.NewServer(capabilities.NewStaticProvider(&remoteexecution.ServerCapabilities{CacheCapabilities: &remoteexecution.CacheCapabilities{
 		DigestFunctions: []remoteexecution.DigestFunction_Value{remoteexecution.DigestFunction_SHA256}, SupportedCompressors: []remoteexecution.Compressor_Value{remoteexecution.Compressor_ZSTD},
@@ -191,6 +198,38 @@ func testCompressedPrimaryStorage(t *testing.T, hierarchical bool) {
 	suffix, err := decoder.DecodeAll(read(t, ctx, frontendConn, d, remoteexecution.Compressor_ZSTD, 19), nil)
 	require.NoError(t, err)
 	require.Equal(t, data[19:], suffix)
+	for _, off := range []int64{1 << 20, (1 << 20) + 19, d.GetSizeBytes()} {
+		before := []int64{storagePool.encoders.Load(), storagePool.decoders.Load(), frontendPool.encoders.Load(), frontendPool.decoders.Load()}
+		encodedSuffix := read(t, ctx, frontendConn, d, remoteexecution.Compressor_ZSTD, off)
+		suffix, err := decoder.DecodeAll(encodedSuffix, nil)
+		require.NoError(t, err)
+		require.Equal(t, data[off:], suffix)
+		var codecs int64
+		if off == (1<<20)+19 {
+			codecs = 1
+		}
+		require.Equal(t, []int64{before[0] + codecs, before[1] + codecs, before[2], before[3]}, []int64{storagePool.encoders.Load(), storagePool.decoders.Load(), frontendPool.encoders.Load(), frontendPool.decoders.Load()})
+		if off == 1<<20 {
+			var expected bytes.Buffer
+			for i := 1; i < index.FrameCount(); i++ {
+				frame, err := index.ReadCompressedFrame(ctx, i)
+				require.NoError(t, err)
+				expected.Write(frame)
+			}
+			require.Equal(t, expected.Bytes(), encodedSuffix)
+		}
+	}
+	for _, off := range []int64{-1, d.GetSizeBytes() + 1} {
+		r, err := bytestream.NewByteStreamClient(frontendConn).Read(ctx, &bytestream.ReadRequest{ResourceName: d.GetByteStreamReadPath(remoteexecution.Compressor_ZSTD), ReadOffset: off})
+		require.NoError(t, err)
+		_, err = r.Recv()
+		require.Equal(t, codes.OutOfRange, status.Code(err))
+	}
+
+	beforeDecoders := storagePool.decoders.Load()
+	require.Equal(t, data[2<<20:], read(t, ctx, storageConn, d, remoteexecution.Compressor_IDENTITY, 2<<20))
+	require.Equal(t, beforeDecoders+1, storagePool.decoders.Load(), "identity offsets must skip earlier frames")
+
 	denied, err := digest.MustNewFunction("denied", remoteexecution.DigestFunction_SHA256).NewDigest(d.GetHashString(), d.GetSizeBytes())
 	require.NoError(t, err)
 	r, err := bytestream.NewByteStreamClient(frontendConn).Read(ctx, &bytestream.ReadRequest{ResourceName: denied.GetByteStreamReadPath(remoteexecution.Compressor_ZSTD)})
@@ -290,7 +329,9 @@ func TestFailedUploadsAreNotPublished(t *testing.T) {
 	require.Len(t, entries, 1)
 	limited, err := blobstore.NewCompressedCASBlobAccess(storage, dir, 1, 1, p)
 	require.NoError(t, err)
-	err = limited.Put(t.Context(), d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided))
+	newData := []byte("not already present")
+	newDigest := digestOf(newData)
+	err = limited.Put(t.Context(), newDigest, buffer.NewCASBufferFromByteSlice(newDigest, newData, buffer.UserProvided))
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()

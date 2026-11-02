@@ -411,45 +411,77 @@ func (r *Reader) WriteCompressed(ctx context.Context, dst io.Writer) error {
 	return checkContext(ctx)
 }
 
+// ReadFrameAt reads the frame containing a logical offset, omitting its prefix.
+// Encoded output retains stored frames at aligned offsets and re-encodes only a
+// partial first frame. The returned offset identifies the next logical frame.
+// Codec leases are released before returning, including before re-encoding.
+func (r *Reader) ReadFrameAt(ctx context.Context, offset int64, compressed bool, pool zstd.Pool) ([]byte, int64, error) {
+	if offset < 0 || offset > r.digest.GetSizeBytes() {
+		return nil, offset, status.Error(codes.OutOfRange, "Logical offset is out of range")
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, offset, err
+	}
+	if offset == r.digest.GetSizeBytes() {
+		if compressed {
+			p, err := compressFrame(ctx, nil, r.index.FrameSize, pool)
+			return p, offset, err
+		}
+		return nil, offset, nil
+	}
+	i := int(offset / int64(r.index.FrameSize))
+	skip := offset % int64(r.index.FrameSize)
+	encoded, err := r.ReadCompressedFrame(ctx, i)
+	if err != nil {
+		return nil, offset, err
+	}
+	f := r.index.Frames[i]
+	next := offset - skip + f.Size
+	if compressed && skip == 0 {
+		return encoded, next, nil
+	}
+	if pool == nil {
+		return nil, offset, status.Error(codes.InvalidArgument, "Decoding requires a codec pool")
+	}
+	decoder, err := pool.NewDecoder(ctx, bytes.NewReader(encoded))
+	if err != nil {
+		return nil, offset, err
+	}
+	data, readErr := io.ReadAll(io.LimitReader(decoder, f.Size+1))
+	decoder.Close()
+	if readErr != nil {
+		return nil, offset, readErr
+	}
+	g := r.digest.GetDigestFunction().NewGenerator(f.Size)
+	g.Write(data)
+	if int64(len(data)) != f.Size || g.Sum().GetHashString() != f.Hash {
+		return nil, offset, status.Error(codes.DataLoss, "Decoded frame digest mismatch")
+	}
+	if err := checkContext(ctx); err != nil {
+		return nil, offset, err
+	}
+	data = data[skip:]
+	if compressed {
+		data, err = compressFrame(ctx, data, r.index.FrameSize, pool)
+	}
+	return data, next, err
+}
+
 // WriteIdentity decodes only frames overlapping the requested logical suffix.
-// A decoder is released before writing to the consumer, so slow readers never
-// hold a codec while waiting for network capacity.
+// Codec leases are released before writing to a potentially slow consumer.
 func (r *Reader) WriteIdentity(ctx context.Context, dst io.Writer, offset int64, pool zstd.Pool) error {
 	if offset < 0 || offset > r.digest.GetSizeBytes() || pool == nil {
 		return status.Error(codes.InvalidArgument, "Invalid logical offset or codec pool")
 	}
-	if offset == r.digest.GetSizeBytes() {
-		return checkContext(ctx)
-	}
-	i := int(offset / int64(r.index.FrameSize))
-	skip := offset % int64(r.index.FrameSize)
-	for ; i < len(r.index.Frames); i++ {
-		encoded, err := r.ReadCompressedFrame(ctx, i)
+	for offset < r.digest.GetSizeBytes() {
+		data, next, err := r.ReadFrameAt(ctx, offset, false, pool)
 		if err != nil {
 			return err
 		}
-		f := r.index.Frames[i]
-		decoder, err := pool.NewDecoder(ctx, bytes.NewReader(encoded))
-		if err != nil {
+		if err := writeAll(dst, data); err != nil {
 			return err
 		}
-		data, err := io.ReadAll(io.LimitReader(decoder, f.Size+1))
-		decoder.Close()
-		if err != nil {
-			return err
-		}
-		g := r.digest.GetDigestFunction().NewGenerator(f.Size)
-		g.Write(data)
-		if int64(len(data)) != f.Size || g.Sum().GetHashString() != f.Hash {
-			return status.Error(codes.DataLoss, "Decoded frame digest mismatch")
-		}
-		if err := checkContext(ctx); err != nil {
-			return err
-		}
-		if err := writeAll(dst, data[skip:]); err != nil {
-			return err
-		}
-		skip = 0
+		offset = next
 	}
 	return checkContext(ctx)
 }

@@ -9,7 +9,6 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
 	"github.com/buildbarn/bb-storage/pkg/digest"
-	"github.com/buildbarn/bb-storage/pkg/util"
 	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 
 	"google.golang.org/genproto/googleapis/bytestream"
@@ -80,23 +79,19 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 		}
 
 	case remoteexecution.Compressor_ZSTD:
-		// Full reads can retain the backend encoding. Offset and retrying
-		// reads must instead operate in logical byte space.
 		b := s.blobAccess.Get(ctx, digest)
-		if in.ReadOffset == 0 {
-			if r, ok := buffer.ZSTDChunkReader(b, s.readChunkSize); ok {
-				defer r.Close()
-				for {
-					p, err := r.Read()
-					if err == io.EOF {
-						return nil
-					}
-					if err != nil {
-						return err
-					}
-					if err := out.Send(&bytestream.ReadResponse{Data: p}); err != nil {
-						return err
-					}
+		if r, ok := buffer.ZSTDChunkReaderAt(b, in.ReadOffset, s.readChunkSize); ok {
+			defer r.Close()
+			for {
+				p, err := r.Read()
+				if err == io.EOF {
+					return nil
+				}
+				if err != nil {
+					return err
+				}
+				if err := out.Send(&bytestream.ReadResponse{Data: p}); err != nil {
+					return err
 				}
 			}
 		}
@@ -207,10 +202,11 @@ func (s *byteStreamServer) writeIdentity(stream bytestream.ByteStream_WriteServe
 }
 
 type zstdWriteStreamReader struct {
-	stream      bytestream.ByteStream_WriteServer
-	nextOffset  int64
-	finished    bool
-	pendingData []byte
+	resourceName string
+	stream       bytestream.ByteStream_WriteServer
+	nextOffset   int64
+	finished     bool
+	pendingData  []byte
 }
 
 func (r *zstdWriteStreamReader) Read(p []byte) (n int, err error) {
@@ -232,6 +228,9 @@ func (r *zstdWriteStreamReader) Read(p []byte) (n int, err error) {
 		return 0, err
 	}
 
+	if req.ResourceName != "" && req.ResourceName != r.resourceName {
+		return 0, status.Error(codes.InvalidArgument, "Resource name changed during write")
+	}
 	if req.WriteOffset != r.nextOffset {
 		return 0, status.Errorf(codes.InvalidArgument, "Attempted to write at offset %d, while %d was expected", req.WriteOffset, r.nextOffset)
 	}
@@ -250,28 +249,30 @@ func (zstdWriteStreamReader) Close() error {
 
 func (s *byteStreamServer) writeZstd(stream bytestream.ByteStream_WriteServer, request *bytestream.WriteRequest, digest digest.Digest) error {
 	ctx := stream.Context()
-	streamReader := &zstdWriteStreamReader{
-		stream:      stream,
-		nextOffset:  int64(len(request.Data)),
-		finished:    request.FinishWrite,
-		pendingData: request.Data,
+	if request.WriteOffset != 0 {
+		return status.Error(codes.InvalidArgument, "Initial compressed write offset must be zero")
 	}
-
-	zstdReader, err := bb_zstd.NewReadCloser(ctx, s.zstdPool, streamReader)
-	if err != nil {
-		return util.StatusWrap(err, "Failed to acquire ZSTD decoder")
+	streamReader := &zstdWriteStreamReader{
+		resourceName: request.ResourceName,
+		stream:       stream,
+		nextOffset:   int64(len(request.Data)),
+		finished:     request.FinishWrite,
+		pendingData:  request.Data,
 	}
 
 	if err := s.blobAccess.Put(
 		ctx,
 		digest,
-		buffer.NewCASBufferFromReader(digest, zstdReader, buffer.UserProvided),
+		buffer.NewCASBufferFromZSTDUpload(ctx, digest, streamReader, s.zstdPool),
 	); err != nil {
 		return err
 	}
-	return stream.SendAndClose(&bytestream.WriteResponse{
-		CommittedSize: streamReader.nextOffset,
-	})
+	committed := streamReader.nextOffset
+	if !streamReader.finished || len(streamReader.pendingData) != 0 {
+		// REAPI permits early success for an already stored blob.
+		committed = -1
+	}
+	return stream.SendAndClose(&bytestream.WriteResponse{CommittedSize: committed})
 }
 
 func (byteStreamServer) QueryWriteStatus(ctx context.Context, in *bytestream.QueryWriteStatusRequest) (*bytestream.QueryWriteStatusResponse, error) {

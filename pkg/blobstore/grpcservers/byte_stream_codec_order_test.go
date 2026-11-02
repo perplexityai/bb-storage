@@ -75,6 +75,18 @@ func (s *codecOrderStorage) Put(ctx context.Context, _ digest.Digest, b buffer.B
 	return err
 }
 
+// Force the logical fallback used by consumers that inspect or transform
+// bytes. Pure forwarding now avoids codec acquisition altogether.
+type logicalCodecOrderBlobAccess struct{ blobstore.BlobAccess }
+
+func (s logicalCodecOrderBlobAccess) Get(ctx context.Context, d digest.Digest) buffer.Buffer {
+	return buffer.NewCASBufferFromReader(d, s.BlobAccess.Get(ctx, d).ToReader(), buffer.BackendProvided(buffer.Irreparable(d)))
+}
+
+func (s logicalCodecOrderBlobAccess) Put(ctx context.Context, d digest.Digest, b buffer.Buffer) error {
+	return s.BlobAccess.Put(ctx, d, buffer.NewCASBufferFromReader(d, b.ToReader(), buffer.UserProvided))
+}
+
 type codecOrderWriteStream struct {
 	bytestream.ByteStream_WriteServer
 	ctx      context.Context
@@ -130,7 +142,7 @@ func testMixedCodecOrder(t *testing.T, copyBlob bool) {
 	}), grpc.WithInsecure())
 	require.NoError(t, err)
 	defer conn.Close()
-	backend := grpcclients.NewCASBlobAccess(conn, uuid.NewRandom, 64, backendPool)
+	backend := logicalCodecOrderBlobAccess{grpcclients.NewCASBlobAccess(conn, uuid.NewRandom, 64, backendPool)}
 	frontend, err := grpcservers.NewAdmissionControlledByteStreamServer(
 		grpcservers.NewByteStreamServer(backend, 64, frontendPool), 1, 1,
 	)

@@ -6,7 +6,8 @@ bytes through storage and frontend servers without acquiring encoders or decoder
 The logical CAS digest remains the hash and size of the uncompressed bytes.
 
 ```text
-upload -> validate logical bytes -> stage frames + index -> publish local record
+compressed upload -> frontend forwards unchanged -> storage validates + frames
+                                                  -> publish local record
 local compressed record -> storage ByteStream -> frontend ByteStream -> client
                            same compressed frames throughout the full read
 ```
@@ -32,7 +33,8 @@ non-CAS storage do not support this option. Absent configuration retains raw
 storage. To forward compressed reads across a frontend's internal gRPC hop, also
 set that backend's `grpc.enableCompression` and advertise `ZSTD` at the servers.
 
-Before consuming an upload, the storage wrapper reserves one write slot and a
+Already-present blobs skip upload consumption and codec acquisition inside the
+authorized storage Put path. For new blobs, the wrapper reserves one write slot and a
 conservative bound on staging bytes: worst-case encoded frame expansion plus a
 32 MiB index allowance. Excess work fails with `RESOURCE_EXHAUSTED`. An unlinked
 temporary file receives the representation; errors, cancellation, and process
@@ -46,8 +48,12 @@ Ordinary copies into another backend use logical bytes and its own storage forma
 New records use independent 1 MiB logical frames, followed by a bounded index and
 versioned footer. This is the primary copy, not a second read cache. Uploads are
 validated and encoded at storage; arbitrary client-supplied encoded indexes are
-never accepted. Compressed upload hops may still decode and re-encode. The
-zero-codec path applies to full compressed **reads**.
+never accepted. When the internal gRPC hop supports Zstd, the frontend forwards
+untrusted encoded uploads unchanged and returns the validating storage server's
+result. A distinct upload API prevents unvalidated input from entering the trusted
+download fast path. Storage decodes once and encodes the indexed frames; the
+frontend uses no codecs. Identity-only hops and intermediate consumers that need
+logical bytes retain the validating decode/encode fallback.
 
 ## Compatibility and fallback behavior
 
@@ -55,10 +61,14 @@ zero-codec path applies to full compressed **reads**.
 - Full compressed reads verify each stored frame's encoded checksum before
   exposing its bytes. Trusted backend streams retain their encoded representation
   at the frontend; the final client must validate the logical digest.
-- Identity reads and compressed reads with a nonzero logical offset decode as
-  needed. Fallback encoding produces bounded independent frames and releases the
-  encoder before reading more input, including retry input. This avoids holding an
-  encoder while a shared bounded pool is needed for a decoder.
+- Compressed offset reads pass their logical offset through the frontend to
+  storage. Aligned reads forward stored frames unchanged; unaligned reads decode
+  and re-encode only the first partial frame. The decoder is released before
+  acquiring the encoder, and both are released before sending that frame.
+- Direct identity offset reads at storage skip preceding frames. Identity reads
+  through a frontend still use its logical decoding fallback. Retrying reads also
+  retain logical validation. Fallback encoding produces bounded independent frames
+  and releases the encoder before reading more input, including retry input.
 - Authorization, metrics, and shard error annotation remain in the request path.
   Retrying decorators use the logical fallback: compressed byte offsets are not
   safely interchangeable between different encodings of the same blob.
@@ -103,7 +113,14 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
 - A logical blob larger than a block fits through compressed physical allocation.
 - Full compressed reads return exactly the stored frames with zero codec leases.
 - Flat and hierarchical block refreshes preserve those bytes and avoid codecs.
-- Identity and offset reads reconstruct the expected bytes.
+- Compressed uploads use no frontend codecs; storage validates and frames once.
+- Duplicate uploads skip codecs, including across an identity-only internal hop.
+- Aligned compressed offsets use no codecs; partial first frames use one decoder
+  and encoder at storage and none at the frontend. Identity reads remain correct.
+- Truncated uploads, digest/size mismatches, authorization failures, and upload
+  limits are enforced with compressed and identity-only internal hops.
+- Source failures cancel backend codec waits promptly; early backend completion
+  cannot hide deferred local task errors.
 - Denied instances, corrupt frames/indexes, and invalid uploads fail correctly.
 - Retrying a disconnected source resumes at the logical offset with another
   compressed encoding, without holding the encoder during source replacement.

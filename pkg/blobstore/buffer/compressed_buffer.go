@@ -17,8 +17,17 @@ import (
 // False leaves the buffer untouched. Encoded forwarding trusts the backend's
 // logical validation; clients must still validate their logical digest.
 func ZSTDChunkReader(b Buffer, maximumChunkSizeBytes int) (ChunkReader, bool) {
-	if c, ok := b.(interface{ zstdChunkReader(int) (ChunkReader, bool) }); ok {
-		return c.zstdChunkReader(maximumChunkSizeBytes)
+	return ZSTDChunkReaderAt(b, 0, maximumChunkSizeBytes)
+}
+
+// ZSTDChunkReaderAt reads a compressed suffix using logical byte offsets.
+// Retrying decorators fall back to logical reads so replacements never resume
+// an encoded stream at an offset belonging to a different representation.
+func ZSTDChunkReaderAt(b Buffer, offset int64, maximumChunkSizeBytes int) (ChunkReader, bool) {
+	if c, ok := b.(interface {
+		zstdChunkReaderAt(int64, int) (ChunkReader, bool)
+	}); ok {
+		return c.zstdChunkReaderAt(offset, maximumChunkSizeBytes)
 	}
 	return nil, false
 }
@@ -31,11 +40,11 @@ type NonRetryingErrorHandler interface {
 	NonRetrying()
 }
 
-func (b *casErrorHandlingBuffer) zstdChunkReader(limit int) (ChunkReader, bool) {
+func (b *casErrorHandlingBuffer) zstdChunkReaderAt(offset int64, limit int) (ChunkReader, bool) {
 	if _, ok := b.errorHandler.(NonRetryingErrorHandler); !ok {
 		return nil, false
 	}
-	r, ok := ZSTDChunkReader(b.base, limit)
+	r, ok := ZSTDChunkReaderAt(b.base, offset, limit)
 	if !ok {
 		return nil, false
 	}
@@ -61,8 +70,8 @@ func (r *annotatingCompressedReader) Read() ([]byte, error) {
 }
 func (r *annotatingCompressedReader) Close() { r.ChunkReader.Close(); r.handler.Done() }
 
-func (b *casBufferWithBackgroundTask) zstdChunkReader(limit int) (ChunkReader, bool) {
-	r, ok := ZSTDChunkReader(b.base, limit)
+func (b *casBufferWithBackgroundTask) zstdChunkReaderAt(offset int64, limit int) (ChunkReader, bool) {
+	r, ok := ZSTDChunkReaderAt(b.base, offset, limit)
 	if !ok {
 		return nil, false
 	}
@@ -83,12 +92,14 @@ func (s *storedRepresentation) release() {
 }
 
 type compressedBuffer struct {
-	ctx     context.Context
-	digest  digest.Digest
-	source  Source
-	pool    zstd.Pool
-	encoded io.ReadCloser
-	stored  *storedRepresentation
+	ctx         context.Context
+	digest      digest.Digest
+	source      Source
+	pool        zstd.Pool
+	encoded     io.ReadCloser
+	stored      *storedRepresentation
+	upload      bool
+	readEncoded func(int64) (io.ReadCloser, error)
 }
 
 // NewCASBufferFromZSTDReader preserves encoded bytes from a trusted backend.
@@ -96,6 +107,35 @@ type compressedBuffer struct {
 // This constructor must not be used to bypass validation of user uploads.
 func NewCASBufferFromZSTDReader(ctx context.Context, d digest.Digest, r io.ReadCloser, pool zstd.Pool, source Source) Buffer {
 	return &compressedBuffer{ctx: ctx, digest: d, encoded: r, pool: pool, source: source}
+}
+
+// NewCASBufferFromZSTDReadFactory defers a trusted backend read until its
+// logical offset is known. The factory owns each returned stream; it is called
+// at most once, and Discard before consumption requires no RPC or codec.
+func NewCASBufferFromZSTDReadFactory(ctx context.Context, d digest.Digest, read func(int64) (io.ReadCloser, error), pool zstd.Pool, source Source) Buffer {
+	return &compressedBuffer{ctx: ctx, digest: d, readEncoded: read, pool: pool, source: source}
+}
+
+// NewCASBufferFromZSTDUpload retains an untrusted upload until a logical
+// consumer validates it. Only an RPC upload to a validating CAS server may
+// forward these bytes without decoding; they are never eligible for reads.
+func NewCASBufferFromZSTDUpload(ctx context.Context, d digest.Digest, r io.ReadCloser, pool zstd.Pool) Buffer {
+	return &compressedBuffer{ctx: ctx, digest: d, encoded: r, pool: pool, source: UserProvided, upload: true}
+}
+
+// ZSTDUploadReader consumes an encoded upload for forwarding to a CAS server
+// that validates the uncompressed digest and size before returning success.
+// False leaves the buffer untouched. Logical consumers always validate locally.
+func ZSTDUploadReader(b Buffer) (io.ReadCloser, bool) {
+	switch b := b.(type) {
+	case *compressedBuffer:
+		return b.encodedReader(), true
+	case *casBufferWithBackgroundTask:
+		if r, ok := ZSTDUploadReader(b.base); ok {
+			return b.decorateReader(r), true
+		}
+	}
+	return nil, false
 }
 
 // NewCASBufferFromZSTDRepresentation takes ownership of an already opened,
@@ -121,6 +161,13 @@ func WithZSTDContext(b Buffer, ctx context.Context) Buffer {
 }
 
 func (b *compressedBuffer) encodedReader() io.ReadCloser {
+	if b.readEncoded != nil {
+		r, err := b.readEncoded(0)
+		if err != nil {
+			return newErrorReader(err)
+		}
+		return r
+	}
 	if b.stored == nil {
 		return b.encoded
 	}
@@ -152,6 +199,9 @@ func (b *compressedBuffer) ToByteSlice(limit int) ([]byte, error) {
 }
 
 func (b *compressedBuffer) ToChunkReader(off int64, limit int) ChunkReader {
+	if b.stored != nil && off > 0 {
+		return newReaderBackedChunkReader(newChunkReaderBackedReader(&storedSuffixReader{buffer: b, offset: off}), limit)
+	}
 	return b.logical().ToChunkReader(off, limit)
 }
 func (b *compressedBuffer) ToReader() io.ReadCloser { return b.logical().ToReader() }
@@ -166,7 +216,7 @@ func (b *compressedBuffer) toUnvalidatedReader(off int64) io.ReadCloser {
 func (b *compressedBuffer) Discard() {
 	if b.stored != nil {
 		b.stored.release()
-	} else {
+	} else if b.encoded != nil {
 		b.encoded.Close()
 	}
 }
@@ -195,9 +245,57 @@ func (b *compressedBuffer) applyErrorHandler(h ErrorHandler) (Buffer, bool) {
 	return newCASErrorHandlingBuffer(b, h, b.digest, b.source), false
 }
 
-func (b *compressedBuffer) zstdChunkReader(limit int) (ChunkReader, bool) {
-	return newReaderBackedChunkReader(b.encodedReader(), limit), true
+func (b *compressedBuffer) zstdChunkReaderAt(offset int64, limit int) (ChunkReader, bool) {
+	if b.upload {
+		return nil, false
+	}
+	if offset < 0 || offset > b.digest.GetSizeBytes() {
+		b.Discard()
+		return newErrorChunkReader(status.Error(codes.OutOfRange, "Logical offset is out of range")), true
+	}
+	if b.readEncoded != nil {
+		r, err := b.readEncoded(offset)
+		if err != nil {
+			return newErrorChunkReader(err), true
+		}
+		return newReaderBackedChunkReader(r, limit), true
+	}
+	if offset == 0 {
+		return newReaderBackedChunkReader(b.encodedReader(), limit), true
+	}
+	if b.stored != nil {
+		return newReaderBackedChunkReader(newChunkReaderBackedReader(&storedSuffixReader{buffer: b, offset: offset, compressed: true}), limit), true
+	}
+	return nil, false
 }
+
+type storedSuffixReader struct {
+	buffer     *compressedBuffer
+	offset     int64
+	compressed bool
+	done       bool
+}
+
+func (r *storedSuffixReader) Read() ([]byte, error) {
+	if err := r.buffer.ctx.Err(); err != nil {
+		return nil, status.FromContextError(err).Err()
+	}
+	if r.done {
+		return nil, io.EOF
+	}
+	b := r.buffer
+	data, next, err := b.stored.index.ReadFrameAt(b.ctx, r.offset, r.compressed, b.pool)
+	if status.Code(err) == codes.DataLoss {
+		b.source.dataIntegrityCallback(false)
+	}
+	if err != nil {
+		return nil, err
+	}
+	r.offset = next
+	r.done = next == b.digest.GetSizeBytes()
+	return data, nil
+}
+func (r *storedSuffixReader) Close() { r.buffer.Discard() }
 
 type storedFrameReader struct {
 	ctx    context.Context

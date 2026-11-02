@@ -58,6 +58,14 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 		b.Discard()
 		return status.FromContextError(err).Err()
 	}
+	// This runs inside Put, after any upload authorization. Checking in the
+	// protocol handler via FindMissing would instead apply read-side policy.
+	missing, err := ba.BlobAccess.FindMissing(ctx, d.ToSingletonSet())
+	if err != nil || missing.Length() == 0 {
+		b.Discard()
+		return err
+	}
+
 	reservation, err := zstdframes.MaximumStoredSize(d.GetSizeBytes(), storedFrameSize)
 	if err != nil {
 		b.Discard()
