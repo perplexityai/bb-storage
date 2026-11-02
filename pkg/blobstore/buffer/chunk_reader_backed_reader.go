@@ -40,6 +40,5 @@ func (r *chunkReaderBackedReader) Read(p []byte) (int, error) {
 }
 
 func (r *chunkReaderBackedReader) Close() error {
-	r.r.Close()
-	return nil
+	return closeChunkReader(r.r)
 }

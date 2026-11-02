@@ -29,6 +29,7 @@ go_library(
         "reader_backed_chunk_reader.go",
         "skip_upload.go",
         "source.go",
+        "upload_interrupt.go",
         "validated_byte_slice_buffer.go",
         "validated_reader_at_buffer.go",
         "with_error_handler.go",

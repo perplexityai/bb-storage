@@ -20,7 +20,7 @@ func Copy(ctx context.Context, pool Pool, dst io.Writer, src io.Reader) error {
 		var readErr error
 		for size < len(data) && readErr == nil {
 			if err := ctx.Err(); err != nil {
-				return status.FromContextError(err).Err()
+				return contextError(ctx)
 			}
 			n, err := src.Read(data[size:])
 			size += n
@@ -39,7 +39,7 @@ func Copy(ctx context.Context, pool Pool, dst io.Writer, src io.Reader) error {
 			return readErr
 		}
 		if err := ctx.Err(); err != nil {
-			return status.FromContextError(err).Err()
+			return contextError(ctx)
 		}
 		if size == 0 {
 			if first {
@@ -52,7 +52,7 @@ func Copy(ctx context.Context, pool Pool, dst io.Writer, src io.Reader) error {
 				if err != nil {
 					return err
 				}
-				return status.FromContextError(ctx.Err()).Err()
+				return contextError(ctx)
 			}
 			return nil
 		}
@@ -76,7 +76,7 @@ func Copy(ctx context.Context, pool Pool, dst io.Writer, src io.Reader) error {
 			return closeErr
 		}
 		if err := ctx.Err(); err != nil {
-			return status.FromContextError(err).Err()
+			return contextError(ctx)
 		}
 		if readErr == io.EOF {
 			return nil

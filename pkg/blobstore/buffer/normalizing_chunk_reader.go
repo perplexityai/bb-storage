@@ -37,3 +37,5 @@ func (r *normalizingChunkReader) Read() ([]byte, error) {
 		r.lastChunk = chunk
 	}
 }
+
+func (r *normalizingChunkReader) CloseWithError() error { return closeChunkReader(r.ChunkReader) }

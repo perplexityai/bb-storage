@@ -6,6 +6,7 @@ go_test(
         "compressed_storage_test.go",
         "compressed_upload_test.go",
         "review_regression_test.go",
+        "upload_completion_test.go",
     ],
     deps = [
         "//pkg/auth",

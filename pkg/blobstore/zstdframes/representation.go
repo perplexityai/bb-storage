@@ -29,6 +29,11 @@ const (
 	magic            = "BBZSTF01"
 )
 
+// ErrInvalidRepresentation identifies an invalid on-disk format, as opposed to
+// a failure to read its bytes. Only format errors may trigger legacy fallback
+// or invalidate the containing storage block.
+var ErrInvalidRepresentation = status.Error(codes.DataLoss, "Invalid compressed representation index")
+
 type frame struct {
 	Hash        string `json:"hash"`
 	Size        int64  `json:"size"`
@@ -289,7 +294,7 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 // Only representations produced by Encode may be published in this store.
 func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, error) {
 	bad := func() (*Reader, error) {
-		return nil, status.Error(codes.DataLoss, "Invalid compressed representation index")
+		return nil, ErrInvalidRepresentation
 	}
 	if expected == digest.BadDigest || size < footerSize {
 		return bad()

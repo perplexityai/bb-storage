@@ -5,6 +5,7 @@ go_library(
     srcs = [
         "bounded_pool.go",
         "configuration.go",
+        "context_error.go",
         "copy.go",
         "metrics_pool.go",
         "pool.go",

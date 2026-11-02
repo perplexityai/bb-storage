@@ -117,17 +117,23 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
 - Full compressed reads return exactly the stored frames with zero codec leases.
 - Flat and hierarchical block refreshes preserve those bytes and avoid codecs.
 - Compressed uploads use no frontend codecs; storage validates and frames once.
-- Duplicate uploads skip codecs, including across an identity-only internal hop.
+- Compressed duplicate uploads can finish without reading input or acquiring
+  codecs. Identity uploads consume their input to preserve completion failures.
 - Aligned compressed offsets use no codecs; partial first frames use one decoder
   and encoder at storage and none at the frontend. Identity reads remain correct.
 - Truncated uploads, digest/size mismatches, authorization failures, and upload
   limits are enforced with compressed and identity-only internal hops.
-- Source failures cancel backend codec waits promptly; early backend completion
-  cannot hide deferred local task errors.
+- Source failures cancel backend codec waits promptly. Early backend completion
+  interrupts paused upload reads and frontend codec waits, even before the client
+  supplies bytes or closes its send side. Both identity and compressed forwarding
+  preserve source-close and background-task errors.
 - A blocked index read permits unrelated writes to complete. Lazy clones retain
   their record until the final consumer releases it.
 - Known backend acquisition errors propagate before waiting for decoder capacity.
-- Local duplicate uploads retain source-close and background-task errors.
+- Local duplicate uploads retain source-close and background-task errors,
+  including errors carried through opaque reader/chunk adapters.
+- Index I/O failures propagate without corrupt-block eviction or legacy fallback;
+  only invalid format bytes trigger format fallback or corruption reporting.
 - Denied instances, corrupt frames/indexes, and invalid uploads fail correctly.
 - Retrying a disconnected source resumes at the logical offset with another
   compressed encoding, without holding the encoder during source replacement.

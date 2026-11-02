@@ -58,7 +58,7 @@ func NewBoundedPool(
 
 func (p *boundedPool) NewEncoder(ctx context.Context, w io.Writer) (Encoder, error) {
 	if err := util.AcquireSemaphore(ctx, p.encoderSem, 1); err != nil {
-		return nil, err
+		return nil, contextError(ctx)
 	}
 
 	enc := p.encoderPool.Get().(*zstd.Encoder)
@@ -68,7 +68,7 @@ func (p *boundedPool) NewEncoder(ctx context.Context, w io.Writer) (Encoder, err
 
 func (p *boundedPool) NewDecoder(ctx context.Context, r io.Reader) (Decoder, error) {
 	if err := util.AcquireSemaphore(ctx, p.decoderSem, 1); err != nil {
-		return nil, err
+		return nil, contextError(ctx)
 	}
 
 	dec := p.decoderPool.Get().(*zstd.Decoder)

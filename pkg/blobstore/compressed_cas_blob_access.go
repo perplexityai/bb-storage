@@ -153,6 +153,10 @@ func (f *compressedCASReadBufferFactory) NewBufferFromReaderAt(d digest.Digest, 
 		if err == nil {
 			return buffer.NewCASBufferFromZSTDRepresentation(d, r, size, index, f.pool, buffer.BackendProvided(callback))
 		}
+		if err != zstdframes.ErrInvalidRepresentation {
+			r.Close()
+			return buffer.NewBufferFromError(err)
+		}
 		if size == d.GetSizeBytes() {
 			// A raw blob may happen to end in format-like bytes. Only full logical
 			// validation can accept the legacy interpretation of such a record.

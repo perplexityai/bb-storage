@@ -49,14 +49,18 @@ func (r *errorHandlingChunkReader) Read() ([]byte, error) {
 	}
 }
 
-func (r *errorHandlingChunkReader) Close() {
+func (r *errorHandlingChunkReader) Close() { r.CloseWithError() }
+
+func (r *errorHandlingChunkReader) CloseWithError() error {
 	if r.errorHandler != nil {
 		r.errorHandler.Done()
 		r.errorHandler = nil
 	}
 	r.err = io.EOF
 	if r.r != nil {
-		r.r.Close()
+		err := closeChunkReader(r.r)
 		r.r = nil
+		return err
 	}
+	return nil
 }

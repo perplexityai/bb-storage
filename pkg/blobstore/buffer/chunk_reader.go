@@ -9,10 +9,23 @@ import (
 // copied from the stream into an output array. The implementation is
 // responsible for providing space for the data. This interface is
 // similar to how frame-based transfer protocols work, including the
-// Bytestream protocol used by REv2.
+// Bytestream protocol used by REv2. Implementations with completion failures
+// may additionally provide CloseWithError() error; reader adapters preserve
+// those errors when closing the stream.
 type ChunkReader interface {
 	Read() ([]byte, error)
 	Close()
+}
+
+// closeChunkReader preserves completion failures when an adapter can report
+// them. The original ChunkReader interface remains compatible with sources
+// whose Close has no result.
+func closeChunkReader(r ChunkReader) error {
+	if r, ok := r.(interface{ CloseWithError() error }); ok {
+		return r.CloseWithError()
+	}
+	r.Close()
+	return nil
 }
 
 // validateReaderOffset is used by ToChunkReader() to validate the

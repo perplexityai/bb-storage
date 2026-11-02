@@ -2,6 +2,7 @@ package grpcclients
 
 import (
 	"context"
+	"errors"
 	"io"
 	"slices"
 	"sync/atomic"
@@ -71,15 +72,14 @@ func (r *byteStreamChunkReader) Close() {
 	}
 }
 
-type zstdByteStreamWriter struct {
+type byteStreamWriter struct {
 	client       bytestream.ByteStream_WriteClient
 	resourceName string
 	writeOffset  int64
 	sendError    error
-	cancel       context.CancelFunc
 }
 
-func (w *zstdByteStreamWriter) Write(p []byte) (int, error) {
+func (w *byteStreamWriter) Write(p []byte) (int, error) {
 	if err := w.client.Send(&bytestream.WriteRequest{
 		ResourceName: w.resourceName,
 		WriteOffset:  w.writeOffset,
@@ -91,21 +91,6 @@ func (w *zstdByteStreamWriter) Write(p []byte) (int, error) {
 	w.writeOffset += int64(len(p))
 	w.resourceName = ""
 	return len(p), nil
-}
-
-func (w *zstdByteStreamWriter) Close() error {
-	defer w.cancel()
-	if w.sendError == nil {
-		// Send may return EOF because the server already accepted an existing
-		// blob. Receive its result before canceling the RPC.
-		w.client.Send(&bytestream.WriteRequest{
-			ResourceName: w.resourceName,
-			WriteOffset:  w.writeOffset,
-			FinishWrite:  true,
-		})
-	}
-	_, err := w.client.CloseAndRecv()
-	return err
 }
 
 const resourceNameHeader = "build.bazel.remote.execution.v2.resource-name"
@@ -196,83 +181,70 @@ func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer
 		return err
 	}
 
+	defer cancel()
+	copyCtx, stopCopy := context.WithCancelCause(ctx)
+	defer stopCopy(nil)
+	w := &byteStreamWriter{client: client, resourceName: resourceName}
+	var result chan error
+	if interrupt := buffer.UploadReadInterrupt(b); interrupt != nil {
+		result = make(chan error, 1)
+		go func() {
+			var response bytestream.WriteResponse
+			err := client.RecvMsg(&response)
+			stopCopy(buffer.ErrUploadInterrupted)
+			interrupt()
+			result <- err
+		}()
+		// Let admission checks and duplicate detection run even if the source
+		// has not supplied bytes yet. Only one goroutine sends on this RPC.
+		w.Write(nil)
+	}
+	receive := func() error {
+		if result != nil {
+			client.CloseSend()
+			return <-result
+		}
+		_, err := client.CloseAndRecv()
+		return err
+	}
+	b = buffer.WithZSTDContext(b, copyCtx)
+	var r io.ReadCloser
+	var encoded bool
 	if useCompression {
-		byteStreamWriter := &zstdByteStreamWriter{
-			client:       client,
-			resourceName: resourceName,
-			writeOffset:  0,
-			cancel:       cancel,
-		}
-
-		r, encoded := buffer.ZSTDUploadReader(b)
-		var copyErr error
-		if encoded {
-			_, copyErr = io.CopyBuffer(byteStreamWriter, r, make([]byte, ba.readChunkSize))
+		r, encoded = buffer.ZSTDUploadReader(b)
+	}
+	if !encoded {
+		r = b.ToReader()
+	}
+	copyErr := w.sendError
+	if copyErr == nil {
+		if useCompression && !encoded {
+			copyErr = bb_zstd.Copy(copyCtx, ba.zstdPool, w, r)
 		} else {
-			r = b.ToReader()
-			copyErr = bb_zstd.Copy(ctx, ba.zstdPool, byteStreamWriter, r)
-		}
-		closeErr := r.Close()
-		if byteStreamWriter.sendError != nil {
-			remoteErr := byteStreamWriter.Close()
-			if closeErr != nil {
-				return closeErr
-			}
-			return remoteErr
-		}
-		if copyErr == nil {
-			copyErr = closeErr
-		}
-		if copyErr != nil {
-			// A source failure must also interrupt backend codec/admission waits.
-			// Closing only the send side cannot cancel those waits.
-			cancel()
-			client.CloseAndRecv()
-			return copyErr
-		}
-
-		return byteStreamWriter.Close()
-	}
-
-	// Non-compressed path
-	r := b.ToChunkReader(0, ba.readChunkSize)
-	defer r.Close()
-
-	writeOffset := int64(0)
-	for {
-		if data, err := r.Read(); err == nil {
-			// Non-terminating chunk.
-			if client.Send(&bytestream.WriteRequest{
-				ResourceName: resourceName,
-				WriteOffset:  writeOffset,
-				Data:         data,
-			}) != nil {
-				_, err := client.CloseAndRecv()
-				cancel()
-				return err
-			}
-			writeOffset += int64(len(data))
-			resourceName = ""
-		} else if err == io.EOF {
-			// Terminating chunk.
-			if client.Send(&bytestream.WriteRequest{
-				ResourceName: resourceName,
-				WriteOffset:  writeOffset,
-				FinishWrite:  true,
-			}) != nil {
-				_, err := client.CloseAndRecv()
-				cancel()
-				return err
-			}
-			_, err := client.CloseAndRecv()
-			cancel()
-			return err
-		} else if err != nil {
-			cancel()
-			client.CloseAndRecv()
-			return err
+			// Hide WriterTo so every transport message respects readChunkSize.
+			_, copyErr = io.CopyBuffer(w, struct{ io.Reader }{r}, make([]byte, ba.readChunkSize))
 		}
 	}
+	closeErr := r.Close()
+	interrupted := errors.Is(copyErr, buffer.ErrUploadInterrupted)
+	if w.sendError != nil || interrupted {
+		remoteErr := receive()
+		if closeErr != nil {
+			return closeErr
+		}
+		return remoteErr
+	}
+	if copyErr == nil {
+		copyErr = closeErr
+	}
+	if copyErr != nil {
+		// Closing only the send side cannot release a backend codec wait.
+		cancel()
+		receive()
+		return copyErr
+	}
+	client.Send(&bytestream.WriteRequest{ResourceName: w.resourceName, WriteOffset: w.writeOffset, FinishWrite: true})
+	return receive()
 }
 
 func (ba *casBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (digest.Set, error) {

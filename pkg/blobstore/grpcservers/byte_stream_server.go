@@ -158,6 +158,12 @@ func (r *byteStreamWriteServerChunkReader) Read() ([]byte, error) {
 }
 
 func (byteStreamWriteServerChunkReader) Close() {}
+func (r *byteStreamWriteServerChunkReader) ReadInterrupt() func() {
+	if s, ok := r.stream.(*interruptibleWriteStream); ok {
+		return s.ReadInterrupt()
+	}
+	return nil
+}
 
 func (s *byteStreamServer) Write(stream bytestream.ByteStream_WriteServer) error {
 	request, err := stream.Recv()
@@ -174,6 +180,10 @@ func (s *byteStreamServer) Write(stream bytestream.ByteStream_WriteServer) error
 	if err := checkCASUploadSize(digest, s.maximumBlobSizeBytes); err != nil {
 		return err
 	}
+	interruptible := newInterruptibleWriteStream(stream)
+	defer interruptible.cancel(nil)
+	stream = interruptible
+
 	switch compressor {
 	case remoteexecution.Compressor_IDENTITY:
 		return s.writeIdentity(stream, request, digest)
@@ -241,6 +251,13 @@ func (r *zstdWriteStreamReader) Read(p []byte) (n int, err error) {
 	n = copy(p, req.Data)
 	r.pendingData = req.Data[n:]
 	return n, nil
+}
+
+func (r *zstdWriteStreamReader) ReadInterrupt() func() {
+	if s, ok := r.stream.(*interruptibleWriteStream); ok {
+		return s.ReadInterrupt()
+	}
+	return nil
 }
 
 func (zstdWriteStreamReader) Close() error {

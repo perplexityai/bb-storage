@@ -31,3 +31,5 @@ func (r *offsetChunkReader) Read() ([]byte, error) {
 	}
 	return r.ChunkReader.Read()
 }
+
+func (r *offsetChunkReader) CloseWithError() error { return closeChunkReader(r.ChunkReader) }

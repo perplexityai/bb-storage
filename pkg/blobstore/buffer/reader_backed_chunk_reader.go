@@ -52,6 +52,6 @@ func (r *terminalErrorReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-func (r *readerBackedChunkReader) Close() {
-	r.r.Close()
-}
+func (r *readerBackedChunkReader) Close() { r.CloseWithError() }
+
+func (r *readerBackedChunkReader) CloseWithError() error { return r.r.Close() }

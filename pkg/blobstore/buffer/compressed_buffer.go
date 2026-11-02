@@ -68,7 +68,13 @@ func (r *annotatingCompressedReader) Read() ([]byte, error) {
 	}
 	return p, err
 }
-func (r *annotatingCompressedReader) Close() { r.ChunkReader.Close(); r.handler.Done() }
+func (r *annotatingCompressedReader) Close() { r.CloseWithError() }
+
+func (r *annotatingCompressedReader) CloseWithError() error {
+	err := closeChunkReader(r.ChunkReader)
+	r.handler.Done()
+	return err
+}
 
 func (b *casBufferWithBackgroundTask) zstdChunkReaderAt(offset int64, limit int) (ChunkReader, bool) {
 	r, ok := ZSTDChunkReaderAt(b.base, offset, limit)
