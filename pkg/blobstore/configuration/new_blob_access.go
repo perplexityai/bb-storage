@@ -158,6 +158,9 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 				return BlobAccessInfo{}, "", status.Error(codes.InvalidArgument, "CAS compression requires block-device CAS storage")
 			}
 			compressionPool = casCreator.zstdPool
+			if err := blobstore.ValidateCompressedCASConfiguration(compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, compressionPool); err != nil {
+				return BlobAccessInfo{}, "", err
+			}
 		}
 		digestKeyFormat := digest.KeyWithInstance
 		if !backend.Local.HierarchicalInstanceNames {

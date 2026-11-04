@@ -83,7 +83,14 @@ func (b *deferredCASBuffer) toUnvalidatedChunkReader(off int64, limit int) Chunk
 func (b *deferredCASBuffer) toUnvalidatedReader(off int64) io.ReadCloser {
 	return b.resolve().toUnvalidatedReader(off)
 }
-func (b *deferredCASBuffer) CloneCopy(limit int) (Buffer, Buffer) { return b.CloneStream() }
+
+func (b *deferredCASBuffer) CloneCopy(limit int) (Buffer, Buffer) {
+	if b.resolved != nil {
+		return b.resolved.CloneCopy(limit)
+	}
+	return b.CloneStream()
+}
+
 func (b *deferredCASBuffer) CloneStream() (Buffer, Buffer) {
 	if b.resolved != nil {
 		return b.resolved.CloneStream()

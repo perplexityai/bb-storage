@@ -2,8 +2,10 @@ package blobstore
 
 import (
 	"context"
+	"errors"
 	"io"
 	"os"
+	"syscall"
 
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/slicing"
@@ -19,10 +21,11 @@ const storedFrameSize = 1 << 20
 
 type compressedCASBlobAccess struct {
 	BlobAccess
-	directory string
-	bytes     *semaphore.Weighted
-	writes    *semaphore.Weighted
-	pool      zstd.Pool
+	directory          string
+	maximumStagedBytes int64
+	bytes              *semaphore.Weighted
+	writes             *semaphore.Weighted
+	pool               zstd.Pool
 }
 
 // NewCompressedCASBlobAccess stores validated compressed representations in a
@@ -30,17 +33,27 @@ type compressedCASBlobAccess struct {
 // before reading an upload, and unlinked files are reclaimed even after a crash.
 // The directory must reside on a filesystem supporting unlink of open files.
 func NewCompressedCASBlobAccess(base BlobAccess, directory string, maximumStagedBytes, maximumWrites int64, pool zstd.Pool) (BlobAccess, error) {
-	if directory == "" || maximumStagedBytes <= 0 || maximumWrites <= 0 || pool == nil {
-		return nil, status.Error(codes.InvalidArgument, "Compressed storage requires a staging directory, positive byte/write budgets, and a codec pool")
+	if err := ValidateCompressedCASConfiguration(directory, maximumStagedBytes, maximumWrites, pool); err != nil {
+		return nil, err
+	}
+	return &compressedCASBlobAccess{BlobAccess: base, directory: directory, maximumStagedBytes: maximumStagedBytes, bytes: semaphore.NewWeighted(maximumStagedBytes), writes: semaphore.NewWeighted(maximumWrites), pool: pool}, nil
+}
+
+// ValidateCompressedCASConfiguration checks staging requirements before a
+// configuration builder opens or truncates the storage device.
+func ValidateCompressedCASConfiguration(directory string, maximumStagedBytes, maximumWrites int64, pool zstd.Pool) error {
+	minimum, _ := zstdframes.MaximumStoredSize(0, storedFrameSize)
+	if directory == "" || maximumStagedBytes < minimum || maximumWrites <= 0 || pool == nil {
+		return status.Errorf(codes.InvalidArgument, "Compressed storage requires a staging directory, at least %d staging bytes, a positive write budget, and a codec pool", minimum)
 	}
 	info, err := os.Stat(directory)
 	if err != nil {
-		return nil, err
+		return err
 	}
 	if !info.IsDir() {
-		return nil, status.Error(codes.InvalidArgument, "Compression staging path is not a directory")
+		return status.Error(codes.InvalidArgument, "Compression staging path is not a directory")
 	}
-	return &compressedCASBlobAccess{BlobAccess: base, directory: directory, bytes: semaphore.NewWeighted(maximumStagedBytes), writes: semaphore.NewWeighted(maximumWrites), pool: pool}, nil
+	return nil
 }
 
 func (ba *compressedCASBlobAccess) Get(ctx context.Context, d digest.Digest) buffer.Buffer {
@@ -61,11 +74,11 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	// This runs inside Put, after any upload authorization. Checking in the
 	// protocol handler via FindMissing would instead apply read-side policy.
 	missing, err := ba.BlobAccess.FindMissing(ctx, d.ToSingletonSet())
-	if err != nil {
+	if err != nil && status.Code(err) != codes.Unavailable && status.Code(err) != codes.Internal && status.Code(err) != codes.DataLoss && status.Code(err) != codes.Unknown {
 		b.Discard()
 		return err
 	}
-	if missing.Empty() {
+	if err == nil && missing.Empty() {
 		return buffer.SkipUpload(b)
 	}
 
@@ -73,6 +86,10 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	if err != nil {
 		b.Discard()
 		return err
+	}
+	if reservation > ba.maximumStagedBytes {
+		b.Discard()
+		return status.Error(codes.InvalidArgument, "Blob cannot fit the configured staging budget")
 	}
 	if !ba.writes.TryAcquire(1) {
 		b.Discard()
@@ -87,7 +104,7 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	f, err := os.CreateTemp(ba.directory, "bb-storage-compressed-")
 	if err != nil {
 		b.Discard()
-		return err
+		return stagingError(err)
 	}
 	defer f.Close()
 	if err := os.Remove(f.Name()); err != nil {
@@ -109,7 +126,15 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
 	}
-	return ba.BlobAccess.Put(ctx, d, buffer.NewValidatedBufferFromReaderAt(&stagingReader{ctx: ctx, File: f}, reservation-w.remaining))
+	physicalSize := reservation - w.remaining
+	if d.GetSizeBytes() <= 4096 && physicalSize >= d.GetSizeBytes() {
+		// Tiny records do not justify an index. Larger incompressible records
+		// retain frame checksums so indexed random reads remain efficient.
+		// Decode staging directly into the raw allocation without another file.
+		logical := NewCompressedCASReadBufferFactory(ba.pool).NewBufferFromReaderAt(d, &stagingReader{ctx: ctx, File: f}, physicalSize, func(bool) {})
+		return ba.BlobAccess.Put(ctx, d, buffer.WithZSTDContext(logical, ctx))
+	}
+	return ba.BlobAccess.Put(ctx, d, buffer.NewValidatedBufferFromReaderAt(&stagingReader{ctx: ctx, File: f}, physicalSize))
 }
 
 type stagingWriter struct {
@@ -123,7 +148,17 @@ func (w *stagingWriter) Write(p []byte) (int, error) {
 	}
 	n, err := w.file.Write(p)
 	w.remaining -= int64(n)
-	return n, err
+	return n, stagingError(err)
+}
+
+func stagingError(err error) error {
+	if err == nil {
+		return nil
+	}
+	if errors.Is(err, syscall.ENOSPC) || errors.Is(err, syscall.EDQUOT) {
+		return status.Error(codes.ResourceExhausted, "Compression staging filesystem is full")
+	}
+	return status.Errorf(codes.Internal, "Compression staging I/O failed: %v", err)
 }
 
 type stagingReader struct {
@@ -152,6 +187,15 @@ func (f *compressedCASReadBufferFactory) NewBufferFromReaderAt(d digest.Digest, 
 		index, err := zstdframes.Open(r, size, d)
 		if err == nil {
 			return buffer.NewCASBufferFromZSTDRepresentation(d, r, size, index, f.pool, buffer.BackendProvided(callback))
+		}
+		if err == zstdframes.ErrUnsupportedVersion && size == d.GetSizeBytes() {
+			// Raw records may end in format-like bytes. Validate that interpretation,
+			// but do not evict a possibly newer representation if it does not match.
+			return CASReadBufferFactory.NewBufferFromReaderAt(d, r, size, func(valid bool) {
+				if valid {
+					callback(true)
+				}
+			})
 		}
 		if err != zstdframes.ErrInvalidRepresentation {
 			r.Close()

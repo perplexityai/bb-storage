@@ -57,10 +57,10 @@ func TestCompressedUploadForwarding(t *testing.T) {
 	require.NoError(t, err)
 	duplicate, err := bytestream.NewByteStreamClient(storageConn).Write(ctx)
 	require.NoError(t, err)
-	require.NoError(t, duplicate.Send(&bytestream.WriteRequest{ResourceName: d.GetByteStreamWritePath(uuid.New(), remoteexecution.Compressor_ZSTD), Data: []byte("unused"), FinishWrite: false}))
+	require.NoError(t, duplicate.Send(&bytestream.WriteRequest{ResourceName: d.GetByteStreamWritePath(uuid.New(), remoteexecution.Compressor_ZSTD), Data: []byte("unused"), FinishWrite: true}))
 	response, err := duplicate.CloseAndRecv()
 	require.NoError(t, err)
-	require.EqualValues(t, -1, response.CommittedSize)
+	require.EqualValues(t, len("unused"), response.CommittedSize)
 	require.Equal(t, before, []int64{storagePool.encoders.Load(), storagePool.decoders.Load()})
 	// An early backend success must not hide a deferred local task failure.
 	taskErr := status.Error(codes.Unavailable, "secondary write failed")
@@ -68,6 +68,14 @@ func TestCompressedUploadForwarding(t *testing.T) {
 	require.Equal(t, codes.Unavailable, status.Code(remote.Put(ctx, d, b)))
 
 	require.Equal(t, data, read(t, ctx, conn, d, remoteexecution.Compressor_IDENTITY, 0))
+
+	// Check rejection before canceled malformed uploads can still be unwinding.
+	denied, err := digest.MustNewFunction("denied", remoteexecution.DigestFunction_SHA256).NewDigest(d.GetHashString(), d.GetSizeBytes())
+	require.NoError(t, err)
+	before = []int64{storagePool.encoders.Load(), storagePool.decoders.Load(), frontendPool.encoders.Load(), frontendPool.decoders.Load()}
+	_, err = write(denied, encoded, 0, true)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Equal(t, before, []int64{storagePool.encoders.Load(), storagePool.decoders.Load(), frontendPool.encoders.Load(), frontendPool.decoders.Load()})
 
 	for _, tc := range []struct {
 		name   string
@@ -106,13 +114,6 @@ func TestCompressedUploadForwarding(t *testing.T) {
 	missing, err := storage.FindMissing(ctx, changedDigest.ToSingletonSet())
 	require.NoError(t, err)
 	require.Equal(t, changedDigest.ToSingletonSet(), missing)
-
-	denied, err := digest.MustNewFunction("denied", remoteexecution.DigestFunction_SHA256).NewDigest(d.GetHashString(), d.GetSizeBytes())
-	require.NoError(t, err)
-	before = []int64{storagePool.encoders.Load(), storagePool.decoders.Load(), frontendPool.encoders.Load(), frontendPool.decoders.Load()}
-	_, err = write(denied, encoded, 0, true)
-	require.Equal(t, codes.PermissionDenied, status.Code(err))
-	require.Equal(t, before, []int64{storagePool.encoders.Load(), storagePool.decoders.Load(), frontendPool.encoders.Load(), frontendPool.decoders.Load()})
 }
 
 func TestCompressedUploadValidationAndFallback(t *testing.T) {

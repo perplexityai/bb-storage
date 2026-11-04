@@ -71,16 +71,20 @@ func localStorage(t *testing.T, p *observedPool) (blobstore.BlobAccess, string, 
 }
 
 func localStorageMode(t *testing.T, p *observedPool, compressed, hierarchical bool) (blobstore.BlobAccess, string, string) {
+	return localStorageSized(t, p, compressed, hierarchical, 81920)
+}
+
+func localStorageSized(t *testing.T, p *observedPool, compressed, hierarchical bool, deviceBytes int64) (blobstore.BlobAccess, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "blocks")
 	var config pb.BlobAccessConfiguration
 	require.NoError(t, protojson.Unmarshal([]byte(fmt.Sprintf(`{"local":{
 	"keyLocationMap":{"inMemory":{"entries":"1024"},"maximumGetAttempts":16,"maximumPutAttempts":"64"},
-	"blocksOnBlockDevice":{"source":{"file":{"path":%q,"sizeBytes":"81920"}},"spareBlocks":2},
+	"blocksOnBlockDevice":{"source":{"file":{"path":%q,"sizeBytes":"%d"}},"spareBlocks":2},
 	"oldBlocks":1,"currentBlocks":1,"newBlocks":1,
 	"casCompression":{"stagingDirectory":%q,"maximumStagedBytes":"134217728","maximumConcurrentWrites":"2"}
-	}}`, path, dir)), &config))
+	}}`, path, deviceBytes, dir)), &config))
 	if !compressed {
 		config.GetLocal().CasCompression = nil
 	}
@@ -327,12 +331,15 @@ func TestFailedUploadsAreNotPublished(t *testing.T) {
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
-	limited, err := blobstore.NewCompressedCASBlobAccess(storage, dir, 1, 1, p)
+	_, err = blobstore.NewCompressedCASBlobAccess(storage, dir, 1, 1, p)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	minimum, _ := zstdframes.MaximumStoredSize(0, 1<<20)
+	limited, err := blobstore.NewCompressedCASBlobAccess(storage, dir, minimum, 1, p)
 	require.NoError(t, err)
 	newData := []byte("not already present")
 	newDigest := digestOf(newData)
 	err = limited.Put(t.Context(), newDigest, buffer.NewCASBufferFromByteSlice(newDigest, newData, buffer.UserProvided))
-	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 	err = storage.Put(ctx, d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided))

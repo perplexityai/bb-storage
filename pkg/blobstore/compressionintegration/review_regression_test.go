@@ -191,7 +191,7 @@ func (r *uploadCompletionReader) Read(p []byte) (int, error) {
 }
 func (r *uploadCompletionReader) Close() error { r.closes.Add(1); return r.err }
 
-func TestLocalDuplicateClosesEncodedUploadWithoutCodecs(t *testing.T) {
+func TestLocalDuplicateDrainsEncodedUploadWithoutCodecs(t *testing.T) {
 	p := pool()
 	store, _, _ := localStorage(t, p)
 	data := []byte("already present")
@@ -214,7 +214,7 @@ func TestLocalDuplicateClosesEncodedUploadWithoutCodecs(t *testing.T) {
 			var tasks atomic.Int64
 			b := buffer.NewCASBufferFromZSTDUpload(t.Context(), d, r, p).WithTask(func() error { tasks.Add(1); return tc.taskErr }).WithTask(func() error { tasks.Add(1); return nil })
 			require.Equal(t, tc.want, store.Put(t.Context(), d, b))
-			require.Zero(t, r.reads.Load())
+			require.EqualValues(t, 1, r.reads.Load())
 			require.EqualValues(t, 1, r.closes.Load())
 			require.EqualValues(t, 2, tasks.Load())
 			require.Equal(t, before, []int64{p.encoders.Load(), p.decoders.Load()})

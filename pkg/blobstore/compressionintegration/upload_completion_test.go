@@ -27,7 +27,7 @@ func TestBackendCompletionInterruptsPausedUpload(t *testing.T) {
 			for _, reject := range []bool{false, true} {
 				// Identity storage consumes the upload to preserve arbitrary reader
 				// completion errors. Compressed duplicates can be accepted immediately.
-				if !compressedHop && !reject {
+				if !reject {
 					continue
 				}
 				for _, metadataOnly := range []bool{false, true} {
@@ -173,7 +173,7 @@ func (*completionAnnotationHandler) NonRetrying() {}
 
 func TestAnnotatedCompressedReaderPreservesCompletionFailure(t *testing.T) {
 	store, _, _ := localStorage(t, pool())
-	data := []byte("annotated compressed completion")
+	data := bytes.Repeat([]byte("annotated compressed completion"), 1000)
 	d := digestOf(data)
 	require.NoError(t, store.Put(t.Context(), d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided)))
 	expected := status.Error(codes.Unavailable, "Background completion failed")

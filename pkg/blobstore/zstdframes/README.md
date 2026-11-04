@@ -33,20 +33,29 @@ non-CAS storage do not support this option. Absent configuration retains raw
 storage. To forward compressed reads across a frontend's internal gRPC hop, also
 set that backend's `grpc.enableCompression` and advertise `ZSTD` at the servers.
 
-Already-present blobs skip encoded upload consumption and codec acquisition
-inside the authorized storage Put path, while preserving close and background-task
-errors. Inputs without a safe skip path are consumed without being stored again.
-For new blobs, the wrapper reserves one write slot and a conservative bound on staging bytes: worst-case encoded frame expansion plus a
-32 MiB index allowance. Excess work fails with `RESOURCE_EXHAUSTED`. An unlinked
-temporary file receives the representation; errors, cancellation, and process
-exit reclaim it. Validation must finish successfully before the existing local
-allocator publishes the record. The allocator, key-location map, persistence,
-eviction, and reader references remain responsible for the primary store.
-Allocation and local refresh use the physical record length; keys and API sizes
-remain logical. Refresh preserves the compressed representation without codecs.
-Ordinary copies into another backend use logical bytes and its own storage format.
+Already-present blobs drain encoded upload bytes through `FinishWrite` without
+acquiring codecs. This preserves compatibility with older clients that treat an
+early successful response as a failed send. Close and background-task errors
+remain observable. Duplicate detection runs inside the authorized storage Put
+path; failures refreshing an existing record do not prevent a repair upload.
 
-New records use independent 1 MiB logical frames, followed by a bounded index and
+New uploads reserve one write slot and a conservative bound on staging bytes:
+encoded expansion plus metadata proportional to frame count. Empty blobs reserve
+about 2 KiB rather than the maximum index budget. Configuration too small for one
+record is rejected before opening the device. A blob that can never fit returns
+`INVALID_ARGUMENT`; temporary slot or byte-budget contention returns
+`RESOURCE_EXHAUSTED`. Admission remains fail-fast, with no unbounded waiting queue.
+An unlinked temporary file receives the representation. Validation must finish
+before local allocation publishes it. A crash between file creation and unlink
+can leave an empty named file; payload writes begin only after unlink succeeds.
+
+Allocation and refresh use the physical record length; CAS keys and API sizes
+remain logical. Refresh verifies the compressed representation without codecs.
+Tiny records of at most 4 KiB stay raw when indexing would expand them. Larger
+records retain the frame index, including incompressible data, to preserve bounded
+random reads. Ordinary copies into another backend use logical bytes.
+
+Indexed records use independent 1 MiB logical frames, followed by a bounded index and
 versioned footer. This is the primary copy, not a second read cache. Uploads are
 validated and encoded at storage; arbitrary client-supplied encoded indexes are
 never accepted. When the internal gRPC hop supports Zstd, the frontend forwards
@@ -66,10 +75,12 @@ logical bytes retain the validating decode/encode fallback.
   storage. Aligned reads forward stored frames unchanged; unaligned reads decode
   and re-encode only the first partial frame. The decoder is released before
   acquiring the encoder, and both are released before sending that frame.
-- Direct identity offset reads at storage skip preceding frames. Identity reads
+- Stored compressed `ReadAt` and direct identity-offset reads skip preceding
+  frames, including through metrics wrappers. Identity reads
   through a frontend still use its logical decoding fallback. Retrying reads also
   retain logical validation. Fallback encoding produces bounded independent frames
-  and releases the encoder before reading more input, including retry input.
+  and releases the encoder before sending bytes or reading more input, including
+  retry input. Its input buffer is bounded by the expected logical size and 1 MiB.
 - Authorization, metrics, and shard error annotation remain in the request path.
   Retrying decorators use the logical fallback: compressed byte offsets are not
   safely interchangeable between different encodings of the same blob.
@@ -82,7 +93,12 @@ logical bytes retain the validating decode/encode fallback.
 This is a storage-format rollout. **Older raw-only readers cannot read compressed
 records.** Keep a compatible reader and `casCompression` configured after enabling
 writes, or retire the affected cache data before reverting to an older binary.
-Disabling the option is not a safe rollback of a populated compressed store.
+Disabling the option is not a safe rollback of a populated compressed store:
+raw-only validation may invalidate the containing block and all older blocks,
+losing unrelated cache records. A recognized newer footer version returns
+`FAILED_PRECONDITION` without invalidation. A read-compressed/write-raw migration
+mode is not implemented; stopping compressed writes alone would not make existing
+compressed records readable by an older binary.
 Changing shard configuration or deploying this code is a separate operator action.
 
 ## Format integrity and bounds
@@ -99,13 +115,41 @@ and a serialized index of at most 32 MiB. An empty blob has one valid empty fram
 Encoded size and parser entry counts are bounded independently. The whole logical
 blob is never buffered. With the integrated 1 MiB frame size, the format supports
 up to 64 GiB per logical blob; the separate CAS upload policy can impose a lower
-limit. Incompressible and tiny records may occupy more space than raw data.
+limit. Indexed incompressible records may occupy slightly more space than raw
+bytes. Built-in encoders use known-size encoding; a 1 MiB frame does
+not require the default streaming encoder's 8 MiB history window. Keep the decoder
+window limit at least 1 MiB for default integrated stored frames. Smaller configured
+encoder windows are respected rather than enlarged by single-segment encoding. Previously written
+streaming frames may require a larger window until those records have aged out.
+Custom streaming-only codec implementations retain their own frame settings.
 
 `Reader` supports concurrent frame reads when its immutable backing `ReaderAt`
 does. Its owner must keep that backing object alive through all readers. The local
 buffer implementation pins block references across clones and refreshes. Opening
 and validating the index is deferred until consumption, outside the local store
 metadata lock; construction, size queries, and cloning do not read the device.
+Device I/O errors, including `DATA_LOSS` and short reads, do not by themselves
+prove corruption. Only verified format/checksum failures invalidate blocks.
+
+## Remaining operational limits
+
+A write slot spans the upload, and a compressed upload still owns its decoder
+while receiving client bytes. Slow clients can exhaust write slots; reserve
+read-side decoder headroom above concurrent uploads and configure request
+admission and deadlines. Encoder-pool size alone does not bound buffered transport
+memory. Separating upload decoder capacity or staging encoded input before decoding
+requires a distinct resource policy and workload measurements.
+
+Legacy raw records still receive full logical validation on partial reads;
+`dataIntegrityValidationCache` is deliberately bypassed in compressed mode. Large
+legacy records can therefore be expensive for worker-local random reads during
+migration. Compressed records use the indexed path. The JSON index is parsed per
+read; maximum-format-size workloads still need memory and latency measurements.
+
+Logical upload limits do not cap encoded byte volume. Zstandard permits legal
+empty and skippable frames, so a digest-derived encoded-size cap would be an
+additional accepted-upload policy. No such cap is imposed here. It must be chosen
+and tested explicitly before exposing this path to untrusted or unbounded senders.
 
 ## Verification
 
@@ -117,13 +161,13 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
 - Full compressed reads return exactly the stored frames with zero codec leases.
 - Flat and hierarchical block refreshes preserve those bytes and avoid codecs.
 - Compressed uploads use no frontend codecs; storage validates and frames once.
-- Compressed duplicate uploads can finish without reading input or acquiring
-  codecs. Identity uploads consume their input to preserve completion failures.
+- Legacy compressed clients finish duplicate uploads without codec acquisition
+  at storage. Duplicate streams are drained for compatibility.
 - Aligned compressed offsets use no codecs; partial first frames use one decoder
   and encoder at storage and none at the frontend. Identity reads remain correct.
 - Truncated uploads, digest/size mismatches, authorization failures, and upload
   limits are enforced with compressed and identity-only internal hops.
-- Source failures cancel backend codec waits promptly. Early backend completion
+- Source failures cancel backend codec waits promptly. Early backend rejection
   interrupts paused upload reads and frontend codec waits, even before the client
   supplies bytes or closes its send side. Both identity and compressed forwarding
   preserve source-close and background-task errors.
@@ -132,8 +176,12 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
 - Known backend acquisition errors propagate before waiting for decoder capacity.
 - Local duplicate uploads retain source-close and background-task errors,
   including errors carried through opaque reader/chunk adapters.
-- Index I/O failures propagate without corrupt-block eviction or legacy fallback;
-  only invalid format bytes trigger format fallback or corruption reporting.
+- Index/frame I/O failures propagate without corrupt-block eviction. Unsupported
+  versions do not evict records. Isolated metadata mutations cover digest identity,
+  digest function, physical gaps, and decoded frame hashes.
+- Metrics-wrapped random and offset reads touch only the requested frames.
+  Resolved legacy clones can be consumed sequentially, and cloned streams retain
+  terminal close errors. Physical refresh buffers reject alternate data access.
 - Denied instances, corrupt frames/indexes, and invalid uploads fail correctly.
 - Retrying a disconnected source resumes at the logical offset with another
   compressed encoding, without holding the encoder during source replacement.

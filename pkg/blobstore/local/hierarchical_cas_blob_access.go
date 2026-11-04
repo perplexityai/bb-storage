@@ -197,6 +197,7 @@ func (ba *hierarchicalCASBlobAccess) Get(ctx context.Context, blobDigest digest.
 	putWriter, err := ba.locationBlobMap.Put(lookupLocation.SizeBytes)
 	ba.lock.Unlock()
 	if err != nil {
+		b.Discard()
 		return buffer.NewBufferFromError(util.StatusWrap(err, "Failed to refresh blob"))
 	}
 

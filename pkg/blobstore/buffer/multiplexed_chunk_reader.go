@@ -66,7 +66,9 @@ func (r *multiplexedChunkReader) Read() ([]byte, error) {
 	return result.data, result.err
 }
 
-func (r *multiplexedChunkReader) Close() {
+func (r *multiplexedChunkReader) Close() { r.CloseWithError() }
+
+func (r *multiplexedChunkReader) CloseWithError() error {
 	r.lock.Lock()
 	defer r.lock.Unlock()
 
@@ -75,18 +77,21 @@ func (r *multiplexedChunkReader) Close() {
 	}
 	r.pendingConsumers--
 	if r.pendingConsumers > 0 {
-		return
+		return nil
 	}
 
 	if len(r.waitingConsumers) == 0 {
 		// All other consumers have left. We're the last to
 		// close.
-		r.r.Close()
+		err := closeChunkReader(r.r)
 		r.r = nil
+		return err
 	} else {
 		// All other consumers are waiting for us to call
 		// Read(). Read on their behalf, but opt out from the
 		// next iteration.
 		r.readAndShareWithOthers(0)
 	}
+
+	return nil
 }

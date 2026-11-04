@@ -3,15 +3,21 @@ package buffer
 import "io"
 
 // SkipUpload completes an upload whose destination already has the blob.
-// Explicitly marked encoded uploads can be closed without reading or acquiring
-// codecs, but their close and background-task errors still matter.
+// Encoded uploads are drained without acquiring codecs. Older clients treat
+// an early successful server response as a failed send, so duplicates must
+// still consume the encoded stream through FinishWrite.
 // Other buffers are consumed without storing them: Discard alone cannot expose
 // completion errors from arbitrary decorators or synchronized cloned streams.
 func SkipUpload(b Buffer) error {
 	switch b := b.(type) {
 	case *compressedBuffer:
 		if b.upload {
-			return b.encoded.Close()
+			_, readErr := io.Copy(io.Discard, b.encoded)
+			closeErr := b.encoded.Close()
+			if readErr != nil {
+				return readErr
+			}
+			return closeErr
 		}
 	case *casBufferWithBackgroundTask:
 		err := SkipUpload(b.base)

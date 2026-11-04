@@ -3,6 +3,7 @@ package buffer
 import (
 	"context"
 	"io"
+	"sync"
 	"sync/atomic"
 
 	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
@@ -192,10 +193,18 @@ func (b *compressedBuffer) logical() Buffer {
 	if err != nil {
 		return NewBufferFromError(err)
 	}
+	var uploadSource *uploadErrorReader
+	if b.upload {
+		uploadSource = &uploadErrorReader{ReadCloser: r}
+		r = uploadSource
+	}
 	decoded, err := zstd.NewReadCloser(b.ctx, b.pool, r)
 	if err != nil {
 		r.Close()
 		return NewBufferFromError(err)
+	}
+	if uploadSource != nil {
+		decoded = &uploadDecodedReader{ReadCloser: decoded, source: uploadSource}
 	}
 	return NewCASBufferFromReader(b.digest, decoded, b.source)
 }
@@ -203,7 +212,33 @@ func (b *compressedBuffer) logical() Buffer {
 func (b *compressedBuffer) GetSizeBytes() (int64, error) { return b.digest.GetSizeBytes(), nil }
 func (b *compressedBuffer) IntoWriter(w io.Writer) error { return b.logical().IntoWriter(w) }
 func (b *compressedBuffer) ReadAt(p []byte, off int64) (int, error) {
-	return b.logical().ReadAt(p, off)
+	if b.stored == nil {
+		return b.logical().ReadAt(p, off)
+	}
+	defer b.Discard()
+	if off < 0 {
+		return 0, status.Error(codes.InvalidArgument, "Negative read offset")
+	}
+	if off > b.digest.GetSizeBytes() {
+		return 0, io.EOF
+	}
+	n := 0
+	for n < len(p) && off < b.digest.GetSizeBytes() {
+		data, _, err := b.stored.index.ReadFrameAt(b.ctx, off, false, b.pool)
+		if err != nil {
+			if err == zstdframes.ErrCorruptFrame {
+				b.source.dataIntegrityCallback(false)
+			}
+			return n, err
+		}
+		copied := copy(p[n:], data)
+		n += copied
+		off += int64(copied)
+	}
+	if n < len(p) {
+		return n, io.EOF
+	}
+	return n, nil
 }
 
 func (b *compressedBuffer) ToProto(m proto.Message, limit int) (proto.Message, error) {
@@ -305,7 +340,7 @@ func (r *storedSuffixReader) Read() ([]byte, error) {
 	}
 	b := r.buffer
 	data, next, err := b.stored.index.ReadFrameAt(b.ctx, r.offset, r.compressed, b.pool)
-	if status.Code(err) == codes.DataLoss {
+	if err == zstdframes.ErrCorruptFrame {
 		b.source.dataIntegrityCallback(false)
 	}
 	if err != nil {
@@ -333,7 +368,7 @@ func (r *storedFrameReader) Read() ([]byte, error) {
 		return nil, io.EOF
 	}
 	data, err := r.stored.index.ReadCompressedFrame(r.ctx, r.i)
-	if status.Code(err) == codes.DataLoss {
+	if err == zstdframes.ErrCorruptFrame {
 		r.source.dataIntegrityCallback(false)
 	}
 	if err == nil {
@@ -345,7 +380,8 @@ func (r *storedFrameReader) Close() { r.stored.release() }
 
 // ForLocalRefresh consumes the physical representation when refreshing a local
 // record with its existing physical size. Never use for an ordinary Put, whose
-// destination may use a different representation.
+// destination may use a different representation. Other data access methods
+// fail with FailedPrecondition; GetSizeBytes reports only the physical length.
 func ForLocalRefresh(b Buffer) Buffer {
 	if d, ok := b.(*deferredCASBuffer); ok {
 		return ForLocalRefresh(d.resolve())
@@ -358,8 +394,10 @@ func ForLocalRefresh(b Buffer) Buffer {
 
 type storedReference struct{ *storedRepresentation }
 
-func (r *storedReference) ReadAt(p []byte, off int64) (int, error) { return r.r.ReadAt(p, off) }
-func (r *storedReference) Close() error                            { r.release(); return nil }
+func (*storedReference) ReadAt(p []byte, off int64) (int, error) {
+	return 0, status.Error(codes.FailedPrecondition, "Physical refresh buffers support only IntoWriter")
+}
+func (r *storedReference) Close() error { r.release(); return nil }
 
 type representationCopyBuffer struct {
 	Buffer
@@ -369,8 +407,46 @@ type representationCopyBuffer struct {
 func (b *representationCopyBuffer) IntoWriter(w io.Writer) error {
 	defer b.Buffer.Discard()
 	err := b.original.stored.index.WriteRepresentation(b.original.ctx, w)
-	if status.Code(err) == codes.DataLoss {
+	if err == zstdframes.ErrCorruptFrame {
 		b.original.source.dataIntegrityCallback(false)
 	}
 	return err
+}
+
+// Preserve transport failures while classifying malformed encoded input as a
+// client error. The decoder itself does not distinguish those error domains.
+type uploadErrorReader struct {
+	io.ReadCloser
+	mu  sync.Mutex
+	err error
+}
+
+func (r *uploadErrorReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil {
+		r.mu.Lock()
+		r.err = err
+		r.mu.Unlock()
+	}
+	return n, err
+}
+
+func (r *uploadErrorReader) sourceError() error { r.mu.Lock(); defer r.mu.Unlock(); return r.err }
+
+type uploadDecodedReader struct {
+	io.ReadCloser
+	source *uploadErrorReader
+}
+
+func (r *uploadDecodedReader) Read(p []byte) (int, error) {
+	n, err := r.ReadCloser.Read(p)
+	if err != nil && err != io.EOF {
+		if sourceErr := r.source.sourceError(); sourceErr != nil && sourceErr != io.EOF {
+			return n, sourceErr
+		}
+		if _, ok := status.FromError(err); !ok {
+			return n, status.Errorf(codes.InvalidArgument, "Invalid compressed upload: %v", err)
+		}
+	}
+	return n, err
 }

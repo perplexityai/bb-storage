@@ -96,6 +96,9 @@ func (b *casErrorHandlingBuffer) ToByteSlice(maximumSizeBytes int) (data []byte,
 }
 
 func (b *casErrorHandlingBuffer) ToChunkReader(off int64, maximumChunkSizeBytes int) ChunkReader {
+	if _, ok := b.errorHandler.(NonRetryingErrorHandler); ok {
+		return &annotatingCompressedReader{ChunkReader: b.base.ToChunkReader(off, maximumChunkSizeBytes), handler: b.errorHandler}
+	}
 	if err := validateReaderOffset(b.digest.GetSizeBytes(), off); err != nil {
 		b.Discard()
 		return newErrorChunkReader(err)
