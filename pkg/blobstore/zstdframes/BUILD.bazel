@@ -2,7 +2,10 @@ load("@rules_go//go:def.bzl", "go_library", "go_test")
 
 go_library(
     name = "zstdframes",
-    srcs = ["representation.go"],
+    srcs = [
+        "index_cache.go",
+        "representation.go",
+    ],
     importpath = "github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes",
     visibility = ["//visibility:public"],
     deps = [
@@ -17,6 +20,7 @@ go_library(
 go_test(
     name = "zstdframes_test",
     srcs = [
+        "index_cache_test.go",
         "representation_io_test.go",
         "representation_test.go",
         "transport_test.go",

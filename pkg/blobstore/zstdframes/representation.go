@@ -30,8 +30,8 @@ const (
 )
 
 // ErrInvalidRepresentation identifies an invalid on-disk format, as opposed to
-// a failure to read its bytes. Only format errors may trigger legacy fallback
-// or invalidate the containing storage block.
+// a failure to read its bytes. Only format errors may invalidate the containing
+// storage block.
 var ErrInvalidRepresentation = status.Error(codes.DataLoss, "Invalid compressed representation index")
 
 // ErrUnsupportedVersion does not establish corruption of a record written by
@@ -286,16 +286,18 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 // detects storage corruption; it is not authentication of untrusted uploads.
 // Only representations produced by Encode may be published in this store.
 func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, error) {
-	bad := func() (*Reader, error) {
-		return nil, ErrInvalidRepresentation
-	}
 	if expected == digest.BadDigest || size < footerSize {
-		return bad()
+		return nil, ErrInvalidRepresentation
 	}
 	var footer [footerSize]byte
 	if err := readAtFull(source, footer[:], size-footerSize); err != nil {
 		return nil, err
 	}
+	return openIndex(source, size, expected, footer)
+}
+
+func openIndex(source io.ReaderAt, size int64, expected digest.Digest, footer [footerSize]byte) (*Reader, error) {
+	bad := func() (*Reader, error) { return nil, ErrInvalidRepresentation }
 	if string(footer[:6]) == "BBZSTF" && string(footer[:8]) != magic {
 		return nil, ErrUnsupportedVersion
 	}
