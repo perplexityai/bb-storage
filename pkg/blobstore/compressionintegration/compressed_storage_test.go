@@ -338,7 +338,6 @@ func TestFailedUploadsAreNotPublished(t *testing.T) {
 	_, err = blobstore.NewCompressedCASBlobAccess(storage, dir, 1, 1, p)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	minimum, _ := zstdframes.MaximumStoredSize(0, 1<<20)
-	minimum += bb_zstd.MaximumUploadSize(0)
 	limited, err := blobstore.NewCompressedCASBlobAccess(storage, dir, minimum, 1, p)
 	require.NoError(t, err)
 	newData := []byte("not already present")

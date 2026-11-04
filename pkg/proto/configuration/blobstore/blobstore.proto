@@ -9,6 +9,7 @@ import "github.com/buildbarn/bb-storage/pkg/proto/configuration/digest/digest.pr
 import "github.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto";
 import "github.com/buildbarn/bb-storage/pkg/proto/configuration/http/client/client.proto";
 import "github.com/buildbarn/bb-storage/pkg/proto/configuration/lossymap/lossymap.proto";
+import "github.com/buildbarn/bb-storage/pkg/proto/configuration/zstd/zstd.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
@@ -622,13 +623,18 @@ message LocalBlobAccessConfiguration {
     // Do not place this on a memory-backed filesystem.
     string staging_directory = 1;
     // Bounds reserved temporary disk bytes across active uploads, including
-    // both received input and worst-case output with its index. Must accommodate
+    // worst-case encoded output with its index. Must accommodate
     // at least one complete upload; size for concurrent maximum-sized blobs.
     int64 maximum_staged_bytes = 2;
-    // Bounds processing of completely received inputs. Receiving and queued
-    // requests are separately bounded to four times this value. Capacity waits
-    // last at most 30 seconds, or the caller deadline if earlier.
+    // Upload codec concurrency budget. Each codec count defaults to this value.
+    // Receiving and queued requests together are capped at four times this
+    // value. Staging-byte waits last at most 30 seconds or the caller deadline.
     int64 maximum_concurrent_writes = 3;
+    // Separate upload codecs; never shares permits or instances with reads.
+    // Defaults: encoder/decoder counts equal maximum_concurrent_writes,
+    // fastest encoder, 1 MiB encoder window and 8 MiB decoder window.
+    // Counts may be reduced but must not exceed maximum_concurrent_writes.
+    buildbarn.configuration.zstd.PoolConfiguration upload_zstd_pool = 4;
   }
 }
 

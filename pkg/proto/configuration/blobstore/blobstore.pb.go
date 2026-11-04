@@ -14,6 +14,7 @@ import (
 	grpc "github.com/buildbarn/bb-storage/pkg/proto/configuration/grpc"
 	client "github.com/buildbarn/bb-storage/pkg/proto/configuration/http/client"
 	lossymap "github.com/buildbarn/bb-storage/pkg/proto/configuration/lossymap"
+	zstd "github.com/buildbarn/bb-storage/pkg/proto/configuration/zstd"
 	status "google.golang.org/genproto/googleapis/rpc/status"
 	protoreflect "google.golang.org/protobuf/reflect/protoreflect"
 	protoimpl "google.golang.org/protobuf/runtime/protoimpl"
@@ -1896,10 +1897,11 @@ func (x *LocalBlobAccessConfiguration_Persistent) GetMinimumEpochInterval() *dur
 }
 
 type LocalBlobAccessConfiguration_CASCompression struct {
-	state                   protoimpl.MessageState `protogen:"open.v1"`
-	StagingDirectory        string                 `protobuf:"bytes,1,opt,name=staging_directory,json=stagingDirectory,proto3" json:"staging_directory,omitempty"`
-	MaximumStagedBytes      int64                  `protobuf:"varint,2,opt,name=maximum_staged_bytes,json=maximumStagedBytes,proto3" json:"maximum_staged_bytes,omitempty"`
-	MaximumConcurrentWrites int64                  `protobuf:"varint,3,opt,name=maximum_concurrent_writes,json=maximumConcurrentWrites,proto3" json:"maximum_concurrent_writes,omitempty"`
+	state                   protoimpl.MessageState  `protogen:"open.v1"`
+	StagingDirectory        string                  `protobuf:"bytes,1,opt,name=staging_directory,json=stagingDirectory,proto3" json:"staging_directory,omitempty"`
+	MaximumStagedBytes      int64                   `protobuf:"varint,2,opt,name=maximum_staged_bytes,json=maximumStagedBytes,proto3" json:"maximum_staged_bytes,omitempty"`
+	MaximumConcurrentWrites int64                   `protobuf:"varint,3,opt,name=maximum_concurrent_writes,json=maximumConcurrentWrites,proto3" json:"maximum_concurrent_writes,omitempty"`
+	UploadZstdPool          *zstd.PoolConfiguration `protobuf:"bytes,4,opt,name=upload_zstd_pool,json=uploadZstdPool,proto3" json:"upload_zstd_pool,omitempty"`
 	unknownFields           protoimpl.UnknownFields
 	sizeCache               protoimpl.SizeCache
 }
@@ -1955,11 +1957,18 @@ func (x *LocalBlobAccessConfiguration_CASCompression) GetMaximumConcurrentWrites
 	return 0
 }
 
+func (x *LocalBlobAccessConfiguration_CASCompression) GetUploadZstdPool() *zstd.PoolConfiguration {
+	if x != nil {
+		return x.UploadZstdPool
+	}
+	return nil
+}
+
 var File_github_com_buildbarn_bb_storage_pkg_proto_configuration_blobstore_blobstore_proto protoreflect.FileDescriptor
 
 const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_blobstore_blobstore_proto_rawDesc = "" +
 	"\n" +
-	"Qgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blobstore/blobstore.proto\x12!buildbarn.configuration.blobstore\x1aUgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blockdevice/blockdevice.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/cloud/aws/aws.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/cloud/gcp/gcp.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/digest/digest.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto\x1aPgithub.com/buildbarn/bb-storage/pkg/proto/configuration/http/client/client.proto\x1aOgithub.com/buildbarn/bb-storage/pkg/proto/configuration/lossymap/lossymap.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17google/rpc/status.proto\"\xf3\x01\n" +
+	"Qgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blobstore/blobstore.proto\x12!buildbarn.configuration.blobstore\x1aUgithub.com/buildbarn/bb-storage/pkg/proto/configuration/blockdevice/blockdevice.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/cloud/aws/aws.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/cloud/gcp/gcp.proto\x1aKgithub.com/buildbarn/bb-storage/pkg/proto/configuration/digest/digest.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto\x1aPgithub.com/buildbarn/bb-storage/pkg/proto/configuration/http/client/client.proto\x1aOgithub.com/buildbarn/bb-storage/pkg/proto/configuration/lossymap/lossymap.proto\x1aGgithub.com/buildbarn/bb-storage/pkg/proto/configuration/zstd/zstd.proto\x1a\x1egoogle/protobuf/duration.proto\x1a\x1bgoogle/protobuf/empty.proto\x1a\x1fgoogle/protobuf/timestamp.proto\x1a\x17google/rpc/status.proto\"\xf3\x01\n" +
 	"\x16BlobstoreConfiguration\x12z\n" +
 	"\x1bcontent_addressable_storage\x18\x01 \x01(\v2:.buildbarn.configuration.blobstore.BlobAccessConfigurationR\x19contentAddressableStorage\x12]\n" +
 	"\faction_cache\x18\x02 \x01(\v2:.buildbarn.configuration.blobstore.BlobAccessConfigurationR\vactionCache\"\xe3\x0f\n" +
@@ -2006,7 +2015,7 @@ const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_blobstore_blo
 	"\tbackend_a\x18\x01 \x01(\v2:.buildbarn.configuration.blobstore.BlobAccessConfigurationR\bbackendA\x12W\n" +
 	"\tbackend_b\x18\x02 \x01(\v2:.buildbarn.configuration.blobstore.BlobAccessConfigurationR\bbackendB\x12i\n" +
 	"\x11replicator_a_to_b\x18\x03 \x01(\v2>.buildbarn.configuration.blobstore.BlobReplicatorConfigurationR\x0ereplicatorAToB\x12i\n" +
-	"\x11replicator_b_to_a\x18\x04 \x01(\v2>.buildbarn.configuration.blobstore.BlobReplicatorConfigurationR\x0ereplicatorBToA\"\xd1\v\n" +
+	"\x11replicator_b_to_a\x18\x04 \x01(\v2>.buildbarn.configuration.blobstore.BlobReplicatorConfigurationR\x0ereplicatorBToA\"\xac\f\n" +
 	"\x1cLocalBlobAccessConfiguration\x12`\n" +
 	"\x10key_location_map\x18\x04 \x01(\v26.buildbarn.configuration.lossymap.HashMapConfigurationR\x0ekeyLocationMap\x12\x1d\n" +
 	"\n" +
@@ -2031,11 +2040,12 @@ const file_github_com_buildbarn_bb_storage_pkg_proto_configuration_blobstore_blo
 	"\n" +
 	"Persistent\x120\n" +
 	"\x14state_directory_path\x18\x01 \x01(\tR\x12stateDirectoryPath\x12O\n" +
-	"\x16minimum_epoch_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x14minimumEpochInterval\x1a\xab\x01\n" +
+	"\x16minimum_epoch_interval\x18\x02 \x01(\v2\x19.google.protobuf.DurationR\x14minimumEpochInterval\x1a\x86\x02\n" +
 	"\x0eCASCompression\x12+\n" +
 	"\x11staging_directory\x18\x01 \x01(\tR\x10stagingDirectory\x120\n" +
 	"\x14maximum_staged_bytes\x18\x02 \x01(\x03R\x12maximumStagedBytes\x12:\n" +
-	"\x19maximum_concurrent_writes\x18\x03 \x01(\x03R\x17maximumConcurrentWritesB\x10\n" +
+	"\x19maximum_concurrent_writes\x18\x03 \x01(\x03R\x17maximumConcurrentWrites\x12Y\n" +
+	"\x10upload_zstd_pool\x18\x04 \x01(\v2/.buildbarn.configuration.zstd.PoolConfigurationR\x0euploadZstdPoolB\x10\n" +
 	"\x0eblocks_backendJ\x04\b\x01\x10\x02J\x04\b\x02\x10\x03J\x04\b\x03\x10\x04J\x04\b\v\x10\fJ\x04\b\f\x10\rJ\x04\b\b\x10\t\"\xe5\x01\n" +
 	"'ExistenceCachingBlobAccessConfiguration\x12T\n" +
 	"\abackend\x18\x01 \x01(\v2:.buildbarn.configuration.blobstore.BlobAccessConfigurationR\abackend\x12d\n" +
@@ -2160,6 +2170,7 @@ var file_github_com_buildbarn_bb_storage_pkg_proto_configuration_blobstore_blobs
 	(*durationpb.Duration)(nil),                // 37: google.protobuf.Duration
 	(*timestamppb.Timestamp)(nil),              // 38: google.protobuf.Timestamp
 	(*blockdevice.Configuration)(nil),          // 39: buildbarn.configuration.blockdevice.Configuration
+	(*zstd.PoolConfiguration)(nil),             // 40: buildbarn.configuration.zstd.PoolConfiguration
 }
 var file_github_com_buildbarn_bb_storage_pkg_proto_configuration_blobstore_blobstore_proto_depIdxs = []int32{
 	1,  // 0: buildbarn.configuration.blobstore.BlobstoreConfiguration.content_addressable_storage:type_name -> buildbarn.configuration.blobstore.BlobAccessConfiguration
@@ -2235,13 +2246,14 @@ var file_github_com_buildbarn_bb_storage_pkg_proto_configuration_blobstore_blobs
 	39, // 70: buildbarn.configuration.blobstore.LocalBlobAccessConfiguration.BlocksOnBlockDevice.source:type_name -> buildbarn.configuration.blockdevice.Configuration
 	31, // 71: buildbarn.configuration.blobstore.LocalBlobAccessConfiguration.BlocksOnBlockDevice.data_integrity_validation_cache:type_name -> buildbarn.configuration.digest.ExistenceCacheConfiguration
 	37, // 72: buildbarn.configuration.blobstore.LocalBlobAccessConfiguration.Persistent.minimum_epoch_interval:type_name -> google.protobuf.Duration
-	14, // 73: buildbarn.configuration.blobstore.DemultiplexingBlobAccessConfiguration.InstanceNamePrefixesEntry.value:type_name -> buildbarn.configuration.blobstore.DemultiplexedBlobAccessConfiguration
-	1,  // 74: buildbarn.configuration.blobstore.WithLabelsBlobAccessConfiguration.LabelsEntry.value:type_name -> buildbarn.configuration.blobstore.BlobAccessConfiguration
-	75, // [75:75] is the sub-list for method output_type
-	75, // [75:75] is the sub-list for method input_type
-	75, // [75:75] is the sub-list for extension type_name
-	75, // [75:75] is the sub-list for extension extendee
-	0,  // [0:75] is the sub-list for field type_name
+	40, // 73: buildbarn.configuration.blobstore.LocalBlobAccessConfiguration.CASCompression.upload_zstd_pool:type_name -> buildbarn.configuration.zstd.PoolConfiguration
+	14, // 74: buildbarn.configuration.blobstore.DemultiplexingBlobAccessConfiguration.InstanceNamePrefixesEntry.value:type_name -> buildbarn.configuration.blobstore.DemultiplexedBlobAccessConfiguration
+	1,  // 75: buildbarn.configuration.blobstore.WithLabelsBlobAccessConfiguration.LabelsEntry.value:type_name -> buildbarn.configuration.blobstore.BlobAccessConfiguration
+	76, // [76:76] is the sub-list for method output_type
+	76, // [76:76] is the sub-list for method input_type
+	76, // [76:76] is the sub-list for extension type_name
+	76, // [76:76] is the sub-list for extension extendee
+	0,  // [0:76] is the sub-list for field type_name
 }
 
 func init() {

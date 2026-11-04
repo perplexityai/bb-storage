@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -14,10 +15,13 @@ import (
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/configuration"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/grpcclients"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/replication"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
 	"github.com/buildbarn/bb-storage/pkg/clock"
 	"github.com/buildbarn/bb-storage/pkg/digest"
+	pb "github.com/buildbarn/bb-storage/pkg/proto/configuration/blobstore"
 	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 	"github.com/google/uuid"
 	"github.com/klauspost/compress/zstd"
@@ -25,6 +29,7 @@ import (
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/encoding/protojson"
 )
 
 type gatedUpload struct {
@@ -42,7 +47,7 @@ func (r *gatedUpload) Read(p []byte) (int, error) {
 func (*gatedUpload) Close() error { return nil }
 func (r *gatedUpload) unblock()   { r.closeOnce.Do(func() { close(r.release) }) }
 
-func TestStalledUploadDoesNotOwnCodecsOrProcessingSlot(t *testing.T) {
+func TestStalledUploadCannotStarveReadCodecs(t *testing.T) {
 	p := pool()
 	store, _, dir := localStorageBudgeted(t, p, true, false, 81920, 1<<20, 1)
 	data := bytes.Repeat([]byte("stored read frame"), 1000)
@@ -64,9 +69,9 @@ func TestStalledUploadDoesNotOwnCodecsOrProcessingSlot(t *testing.T) {
 	select {
 	case <-gate.entered:
 	case <-time.After(5 * time.Second):
-		t.Fatal("upload did not reach input staging")
+		t.Fatal("upload did not reach streaming decoder")
 	}
-	require.Equal(t, before, []int64{p.encoders.Load(), p.decoders.Load()}, "receiving input must not acquire codecs")
+	require.Equal(t, before, []int64{p.encoders.Load(), p.decoders.Load()}, "uploads must not acquire read-side codecs")
 	ctx, cancel := context.WithTimeout(t.Context(), time.Second)
 	defer cancel()
 	got := make([]byte, 10)
@@ -80,7 +85,7 @@ func TestStalledUploadDoesNotOwnCodecsOrProcessingSlot(t *testing.T) {
 	actual, err := store.Get(t.Context(), digestOf(incoming)).ToByteSlice(len(incoming))
 	require.NoError(t, err)
 	require.Equal(t, incoming, actual)
-	// Both input and representation files are unlinked after success.
+	// The single representation staging file is unlinked after success.
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
@@ -92,7 +97,6 @@ func TestStagingContentionWaitsAndCancellationReleasesAdmission(t *testing.T) {
 	d := digestOf(data)
 	reservation, err := zstdframes.MaximumStoredSize(int64(len(data)), 1<<20)
 	require.NoError(t, err)
-	reservation += bb_zstd.MaximumUploadSize(int64(len(data)))
 	store, _, _ := localStorageBudgeted(t, p, true, false, 81920, reservation, 1)
 	gate := &gatedUpload{Reader: bytes.NewReader(data), entered: make(chan struct{}), release: make(chan struct{})}
 	defer gate.unblock()
@@ -234,11 +238,7 @@ func TestEncodedStagingRetryReplacesWholeRepresentation(t *testing.T) {
 			require.NoError(t, store.Put(t.Context(), d, input))
 			require.Equal(t, 1, h.calls)
 			require.Equal(t, 1, h.done)
-			decoders := int64(1)
-			if malformed {
-				decoders++
-			}
-			require.EqualValues(t, decoders, p.decoders.Load()-before)
+			require.EqualValues(t, 0, p.decoders.Load()-before, "replication uploads use their destination codec pool")
 			actual, err := store.Get(t.Context(), d).ToByteSlice(len(data))
 			require.NoError(t, err)
 			require.Equal(t, data, actual)
@@ -274,9 +274,10 @@ func TestStagedBackendIntegrityCallbackRetainsSource(t *testing.T) {
 	require.Equal(t, d.ToSingletonSet(), missing)
 }
 
-func TestStagedDecodeUsesDestinationDeadline(t *testing.T) {
+func TestStreamingDecodeUsesDestinationDeadline(t *testing.T) {
 	p := pool()
-	store, _, _ := localStorage(t, p)
+	store, err := blobstore.NewCompressedCASBlobAccess(&repairRecordStore{lookupError: status.Error(codes.Unavailable, "missing")}, t.TempDir(), 1<<20, 1, p)
+	require.NoError(t, err)
 	data := bytes.Repeat([]byte("local decode deadline"), 1000)
 	d := digestOf(data)
 	encoder, err := zstd.NewWriter(nil, zstd.WithEncoderConcurrency(1))
@@ -311,7 +312,8 @@ func TestStagingDestinationFailureDoesNotBlameSource(t *testing.T) {
 	h := &stagingRetryHandler{}
 	b := buffer.WithErrorHandler(buffer.NewCASBufferFromReader(d, source, buffer.BackendProvided(buffer.Irreparable(d))), h)
 	failure := status.Error(codes.ResourceExhausted, "staging disk full")
-	err := buffer.StageCASUpload(t.Context(), b, func(r io.ReadCloser, _ func(io.ReadCloser) io.ReadCloser) error {
+	err := buffer.ConsumeCASUpload(t.Context(), b, pool(), func(input buffer.Buffer) error {
+		r := input.ToReader()
 		defer r.Close()
 		return &buffer.UploadDestinationError{Err: failure}
 	})
@@ -354,4 +356,102 @@ func TestDuplicateUploadsShareTheBoundedRequestQueue(t *testing.T) {
 	}
 	require.Equal(t, before, []int64{p.encoders.Load(), p.decoders.Load()})
 	require.NoError(t, store.Put(t.Context(), d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided)))
+}
+
+func TestStreamingUploadEncodesBeforeInputCompletes(t *testing.T) {
+	p := pool()
+	base := &repairRecordStore{lookupError: status.Error(codes.Unavailable, "missing")}
+	dir := t.TempDir()
+	data := bytes.Repeat([]byte("s"), 2<<20)
+	d := digestOf(data)
+	reservation, err := zstdframes.MaximumStoredSize(int64(len(data)), 1<<20)
+	require.NoError(t, err)
+	// Only output space is available: reserving or spooling the input would fail.
+	store, err := blobstore.NewCompressedCASBlobAccess(base, dir, reservation, 1, p)
+	require.NoError(t, err)
+	gate := &gatedUpload{Reader: bytes.NewReader(data[1<<20:]), entered: make(chan struct{}), release: make(chan struct{})}
+	defer gate.unblock()
+	source := io.NopCloser(io.MultiReader(bytes.NewReader(data[:1<<20]), gate))
+	done := make(chan error, 1)
+	go func() {
+		done <- store.Put(t.Context(), d, buffer.NewCASBufferFromReader(d, source, buffer.UserProvided))
+	}()
+	select {
+	case <-gate.entered:
+	case <-time.After(time.Second):
+		t.Fatal("upload did not stream through its first frame")
+	}
+	require.EqualValues(t, 1, p.encoders.Load(), "the first frame must be encoded while later input is still blocked")
+	gate.unblock()
+	require.NoError(t, <-done)
+	r, err := zstdframes.Open(bytes.NewReader(base.record), int64(len(base.record)), d)
+	require.NoError(t, err)
+	var actual bytes.Buffer
+	require.NoError(t, r.WriteIdentity(t.Context(), &actual, 0, p))
+	require.Equal(t, data, actual.Bytes())
+	entries, err := os.ReadDir(dir)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
+type repairFallbackHandler struct {
+	ctx        context.Context
+	d          digest.Digest
+	replicator replication.BlobReplicator
+	calls      int
+}
+
+func (*repairFallbackHandler) Done() {}
+func (h *repairFallbackHandler) OnError(err error) (buffer.Buffer, error) {
+	h.calls++
+	if h.calls > 1 {
+		return nil, err
+	}
+	return h.replicator.ReplicateSingle(h.ctx, h.d), nil
+}
+
+type repairSource struct {
+	blobstore.BlobAccess
+	data []byte
+}
+
+func (s repairSource) Get(_ context.Context, d digest.Digest) buffer.Buffer {
+	return buffer.NewCASBufferFromByteSlice(d, s.data, buffer.BackendProvided(buffer.Irreparable(d)))
+}
+
+func TestStreamingFallbackCanRepairThroughSameStore(t *testing.T) {
+	p := pool()
+	store, _, _ := localStorageBudgeted(t, p, true, false, 81920, 1<<20, 1)
+	data := bytes.Repeat([]byte("fallback repair source"), 1000)
+	d := digestOf(data)
+	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
+	defer cancel()
+	h := &repairFallbackHandler{ctx: ctx, d: d, replicator: replication.NewLocalBlobReplicator(repairSource{data: data}, store)}
+	bad := buffer.NewCASBufferFromZSTDReader(ctx, d, io.NopCloser(bytes.NewReader([]byte("malformed"))), p, buffer.BackendProvided(buffer.Irreparable(d)))
+	require.NoError(t, store.Put(ctx, d, buffer.WithErrorHandler(bad, h)))
+	require.Equal(t, 1, h.calls)
+	actual, err := store.Get(ctx, d).ToByteSlice(len(data))
+	require.NoError(t, err)
+	require.Equal(t, data, actual)
+}
+
+func TestIncompatibleUploadWindowsFailBeforeOpeningStorage(t *testing.T) {
+	for _, selfMismatch := range []bool{false, true} {
+		t.Run(fmt.Sprintf("self=%t", selfMismatch), func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "blocks")
+			var config pb.BlobAccessConfiguration
+			extra := ""
+			readPool := bb_zstd.NewBoundedPool(1, 1, []zstd.EOption{zstd.WithWindowSize(64 << 10)}, []zstd.DOption{zstd.WithDecoderMaxWindow(64 << 10)})
+			if selfMismatch {
+				extra = `,"uploadZstdPool":{"decoderWindowSizeBytes":1024}`
+				readPool = pool()
+			}
+			require.NoError(t, protojson.Unmarshal([]byte(fmt.Sprintf(`{"local":{"blocksOnBlockDevice":{"source":{"file":{"path":%q,"sizeBytes":"81920"}}},"casCompression":{"stagingDirectory":%q,"maximumStagedBytes":"1048576","maximumConcurrentWrites":"1"%s}}}`, path, dir, extra)), &config))
+			_, err := configuration.NewBlobAccessFromConfiguration(nil, &config, configuration.NewCASBlobAccessCreator(nil, 4<<20, readPool))
+			require.Equal(t, codes.InvalidArgument, status.Code(err))
+			_, err = os.Stat(path)
+			require.True(t, os.IsNotExist(err), "incompatible codec settings must fail before opening the device")
+		})
+	}
 }

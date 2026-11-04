@@ -45,12 +45,13 @@ func TestCompressedUploadForwarding(t *testing.T) {
 		_ = w.Send(&bytestream.WriteRequest{ResourceName: d.GetByteStreamWritePath(uuid.New(), remoteexecution.Compressor_ZSTD), WriteOffset: offset, Data: data, FinishWrite: finish})
 		return w.CloseAndRecv()
 	}
+	readPoolBefore := []int64{storagePool.encoders.Load(), storagePool.decoders.Load()}
 	_, err = write(d, encoded, 0, true)
 	require.NoError(t, err)
 	require.Zero(t, frontendPool.encoders.Load())
 	require.Zero(t, frontendPool.decoders.Load())
-	require.EqualValues(t, 1, storagePool.decoders.Load())
-	require.EqualValues(t, 3, storagePool.encoders.Load())
+	require.Equal(t, readPoolBefore[1], storagePool.decoders.Load(), "uploads must not take read-side decoders")
+	require.Equal(t, readPoolBefore[0], storagePool.encoders.Load(), "uploads must not take read-side encoders")
 	before := []int64{storagePool.encoders.Load(), storagePool.decoders.Load()}
 	// A duplicate can finish before consuming any bytes, without a codec lease.
 	_, err = write(d, []byte("not a zstd stream"), 0, true)

@@ -26,7 +26,6 @@ type compressedCASBlobAccess struct {
 	directory          string
 	maximumStagedBytes int64
 	bytes              *semaphore.Weighted
-	writes             *semaphore.Weighted
 	requests           *semaphore.Weighted
 	pool               zstd.Pool
 }
@@ -35,18 +34,18 @@ type compressedCASBlobAccess struct {
 // local block store using NewCompressedCASReadBufferFactory. Staging is bounded
 // before reading an upload, and unlinked files are reclaimed even after a crash.
 // The directory must reside on a filesystem supporting unlink of open files.
+// pool must be dedicated to uploads, separate from the read-buffer factory's pool.
 func NewCompressedCASBlobAccess(base BlobAccess, directory string, maximumStagedBytes, maximumWrites int64, pool zstd.Pool) (BlobAccess, error) {
 	if err := ValidateCompressedCASConfiguration(directory, maximumStagedBytes, maximumWrites, pool); err != nil {
 		return nil, err
 	}
-	return &compressedCASBlobAccess{BlobAccess: base, directory: directory, maximumStagedBytes: maximumStagedBytes, bytes: semaphore.NewWeighted(maximumStagedBytes), writes: semaphore.NewWeighted(maximumWrites), requests: semaphore.NewWeighted(4 * maximumWrites), pool: pool}, nil
+	return &compressedCASBlobAccess{BlobAccess: base, directory: directory, maximumStagedBytes: maximumStagedBytes, bytes: semaphore.NewWeighted(maximumStagedBytes), requests: semaphore.NewWeighted(4 * maximumWrites), pool: pool}, nil
 }
 
 // ValidateCompressedCASConfiguration checks staging requirements before a
 // configuration builder opens or truncates the storage device.
 func ValidateCompressedCASConfiguration(directory string, maximumStagedBytes, maximumWrites int64, pool zstd.Pool) error {
 	minimum, _ := zstdframes.MaximumStoredSize(0, storedFrameSize)
-	minimum += zstd.MaximumUploadSize(0)
 	if directory == "" || maximumStagedBytes < minimum || maximumWrites <= 0 || maximumWrites > math.MaxInt64/4 || pool == nil {
 		return status.Errorf(codes.InvalidArgument, "Compressed storage requires a staging directory, at least %d staging bytes, a positive write budget, and a codec pool", minimum)
 	}
@@ -100,26 +99,11 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 		b.Discard()
 		return status.Error(codes.InvalidArgument, "Blob cannot fit the configured staging budget")
 	}
-	// Bound requests even while waiting for bytes. Receiving input does not
-	// consume a codec or a processing slot; only local I/O follows admission
-	// to the processing stage.
-	inputLimit := zstd.MaximumUploadSize(d.GetSizeBytes())
-	if inputLimit > ba.maximumStagedBytes-reservation {
-		b.Discard()
-		return status.Error(codes.InvalidArgument, "Blob input and representation cannot fit the configured staging budget")
-	}
-	reservation += inputLimit
 	if err := acquireUploadCapacity(ctx, ba.bytes, reservation); err != nil {
 		b.Discard()
 		return err
 	}
 	defer ba.bytes.Release(reservation)
-	input, err := ba.createStagingFile()
-	if err != nil {
-		b.Discard()
-		return err
-	}
-	defer input.Close()
 	f, err := ba.createStagingFile()
 	if err != nil {
 		b.Discard()
@@ -127,47 +111,28 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	}
 	defer f.Close()
 	var physicalSize int64
-	if err := buffer.StageCASUpload(ctx, b, func(source io.ReadCloser, logical func(io.ReadCloser) io.ReadCloser) (result error) {
-		defer func() {
-			if err := source.Close(); result == nil {
-				result = err
-			}
-		}()
-		// A replacement may have a different encoding and length. Drop both
-		// previous files before starting the attempt, while retaining reservations.
-		for _, file := range []*os.File{input, f} {
-			if err := file.Truncate(0); err != nil {
-				return &buffer.UploadDestinationError{Err: stagingError(err)}
-			}
-			if _, err := file.Seek(0, io.SeekStart); err != nil {
-				return &buffer.UploadDestinationError{Err: stagingError(err)}
-			}
-		}
-		bounded := zstd.LimitUpload(source, d.GetSizeBytes())
-		if _, err := io.Copy(&stagingWriter{file: input, remaining: inputLimit}, bounded); err != nil {
-			return err
-		}
-		if _, err := input.Seek(0, io.SeekStart); err != nil {
-			return &buffer.UploadDestinationError{Err: stagingError(err)}
-		}
-		if err := acquireUploadCapacity(ctx, ba.writes, 1); err != nil {
-			return &buffer.UploadDestinationError{Err: err}
-		}
-		defer ba.writes.Release(1)
-		r := logical(io.NopCloser(&stagingInput{ctx: ctx, Reader: input}))
+	if err := buffer.ConsumeCASUpload(ctx, b, ba.pool, func(input buffer.Buffer) (result error) {
+		r := input.ToReader()
 		defer func() {
 			if err := r.Close(); result == nil {
 				result = err
 			}
 		}()
-		w := &stagingWriter{file: f, remaining: reservation - inputLimit}
+		// A retry replaces the entire output, including any longer previous tail.
+		if err := f.Truncate(0); err != nil {
+			return &buffer.UploadDestinationError{Err: stagingError(err)}
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			return &buffer.UploadDestinationError{Err: stagingError(err)}
+		}
+		w := &stagingWriter{file: f, remaining: reservation}
 		if err := zstdframes.Encode(ctx, w, d, r, storedFrameSize, ba.pool); err != nil {
 			return err
 		}
 		if err := ctx.Err(); err != nil {
 			return status.FromContextError(err).Err()
 		}
-		physicalSize = reservation - inputLimit - w.remaining
+		physicalSize = reservation - w.remaining
 		return nil
 	}); err != nil {
 		return err
@@ -212,22 +177,6 @@ func (ba *compressedCASBlobAccess) createStagingFile() (*os.File, error) {
 type stagingWriter struct {
 	file      *os.File
 	remaining int64
-}
-
-type stagingInput struct {
-	ctx context.Context
-	io.Reader
-}
-
-func (r *stagingInput) Read(p []byte) (int, error) {
-	if err := r.ctx.Err(); err != nil {
-		return 0, &buffer.UploadDestinationError{Err: status.FromContextError(err).Err()}
-	}
-	n, err := r.Reader.Read(p)
-	if err != nil && err != io.EOF {
-		return n, &buffer.UploadDestinationError{Err: stagingError(err)}
-	}
-	return n, err
 }
 
 func (w *stagingWriter) Write(p []byte) (int, error) {

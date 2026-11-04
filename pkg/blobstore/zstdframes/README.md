@@ -39,29 +39,38 @@ early successful response as a failed send. Close and background-task errors
 remain observable. Duplicate detection runs inside the authorized storage Put
 path; failures refreshing an existing record do not prevent a repair upload.
 
-Uploads reserve space for both received input and the encoded output plus index.
-Input is received completely into an unlinked file before acquiring a decoder or
-processing slot. Slow upload clients therefore consume bounded disk staging and
-request capacity, not codecs needed by reads. `maximumConcurrentWrites` bounds
-local validation/encoding; at most four times that many requests may receive or
-wait. Byte-budget and processing waits last at most 30 seconds, or the caller's
-deadline if earlier. A full request queue or expired capacity wait returns
-`RESOURCE_EXHAUSTED`; caller cancellation retains its own status. Requests already
-converted to logical streams by an upstream consumer may still own that consumer's
-decoder; staging cannot undo earlier decoding.
+Uploads stream through validation and frame encoding into one unlinked output
+file. Encoding starts as frames arrive; there is no input spool or replay pass.
+The conservative output reservation is roughly 1.125 times logical size plus
+framing/index overhead. A 256 MiB upload reserves about 289 MiB, regardless of its
+actual compression ratio. A 1 GiB budget can admit three such reservations. Size
+for concurrent maximum-sized writes, including repair/replication; a nested repair
+into the same destination needs an additional reservation and may time out if
+all staging capacity is held by its callers. Blobs that can never fit return
+`INVALID_ARGUMENT`; configuration too small for an empty record fails at startup.
 
-The reservation includes worst-case input and output simultaneously, roughly
-2.25 times logical size plus framing/index overhead. Size the budget for concurrent
-maximum-sized blobs, not just their compressed average. With the 1 GiB example,
-one 256 MiB blob fits but two such worst-case reservations do not; a 2 GiB budget
-admits three. A blob that can never fit returns `INVALID_ARGUMENT`. Configuration
-too small for even an empty upload fails before opening the block device.
+`maximumConcurrentWrites` is the upload codec concurrency budget. Uploads have
+separate encoder and decoder pools, independent of read-side codecs. The default
+counts equal that budget, with fastest encoding, a 1 MiB encoder window, and an
+8 MiB decoder window. Optional `uploadZstdPool` overrides these settings using the
+Zstd pool configuration schema; codec counts cannot exceed the budget. Both pools
+contribute to total process memory. Startup checks that read decoders can decode
+the upload pool's stored frames before opening the device.
 
-Whole-input retries restart both staging files, preserving source error handlers,
-backend integrity callbacks, and completion errors through local validation.
-Nothing is published until every validation and completion check succeeds. A
-crash between file creation and unlink can leave an empty named file; payload
-writes begin only after unlink succeeds.
+Slow compressed clients hold upload decoders while receiving. They cannot consume
+read-side codec capacity. At most four times the budget may be receiving or waiting,
+including duplicates; a full request queue returns `RESOURCE_EXHAUSTED`. Requests
+wait up to 30 seconds for staging bytes, or their own deadline if earlier. Codec
+waits use the request deadline. Identity streams do not acquire an upload decoder;
+they acquire an encoder only after a logical frame is available. Encoder leases
+release before receiving further input or sending output. There is no extra write
+semaphore spanning source reads, which would deadlock synchronized replication
+clones sharing the same destination.
+
+Whole-input retries reset the output file and retain source error handlers,
+backend integrity callbacks, and completion errors through validation. Nothing is
+published until all checks succeed. A crash between temporary-file creation and
+unlink can leave an empty named file; payload writes begin only after unlink.
 
 Allocation and refresh use the physical record length; CAS keys and API sizes
 remain logical. Refresh verifies the compressed representation without codecs.
@@ -118,7 +127,7 @@ Its caller must publish only after successful completion; a readable temporary
 object alone does not establish success after cancellation or an I/O error.
 `Open` checks the index against the expected logical digest. Checksums detect
 accidental corruption, not hostile replacement of both content and metadata.
-Only representations produced by successful local validation may be published.
+Only representations produced by successful streaming validation may be published.
 
 The format supports logical frame sizes from 4 KiB to 4 MiB, at most 65,536 frames,
 and a serialized index of at most 32 MiB. An empty blob has one valid empty frame.
@@ -151,17 +160,18 @@ prove corruption. Only verified format/checksum failures invalidate blocks.
 Compressed upload ingress is limited to logical size plus 12.5%, 1 KiB per logical
 MiB (rounded up, minimum one), and 1 KiB fixed overhead. The frontend checks this
 while forwarding, without acquiring codecs. Storage applies the same bound to
-staged input, including compressed replication streams. Excess input returns
+streaming input, including compressed replication streams. Excess input returns
 `INVALID_ARGUMENT`, including oversized duplicates. This is an explicit upload
 policy: otherwise legal Zstandard streams containing excessive empty or skippable
 frames are rejected. Existing logical blob-size limits remain independent.
 
 Slow clients can still fill the finite receive queue or staging budget. Configure
 RPC admission/deadlines and size staging for the intended concurrent workload;
-overload remains a bounded rejection, not unlimited buffering. Staging adds local
-disk I/O and delays encoding until receive completion. Encoder-pool size alone
-does not bound transport memory. Read-side logical consumers and synchronized
-logical replication clones may still decode network streams as they consume them.
+overload remains a bounded rejection, not unlimited buffering. Only the validated
+output representation is staged before publication. Encoder-pool size alone does
+not bound transport memory. Read-side logical consumers and synchronized logical
+replication clones may still decode network streams as they consume them; codecs
+already acquired by an upstream consumer cannot be moved to the upload pool.
 
 ## Verification
 
@@ -198,8 +208,12 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
 - Retrying a disconnected source resumes at the logical offset with another
   compressed encoding, without holding the encoder during source replacement.
 - Failed uploads release staging resources; copying to raw storage stays logical.
-- Stalled metrics-wrapped encoded inputs consume no codec or processing slot;
-  a one-decoder pool still serves reads and another write.
+- Stalled metrics-wrapped uploads use the isolated upload pool; a one-decoder
+  read pool still serves reads. Identity writes can use available upload encoders.
+- A blocked later input frame does not prevent encoding an earlier frame, and
+  uploads succeed with only the output reservation available.
+- Incompatible upload/read codec windows fail before the storage device opens.
+  Recursive same-destination repair succeeds with sufficient staging headroom.
 - Staging contention waits, honors cancellation, and admits work after release.
 - Malformed primary streams retry from a complete replacement encoding, retaining
   backend integrity attribution and source lifetime through validation.

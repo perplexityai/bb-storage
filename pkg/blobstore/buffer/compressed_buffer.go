@@ -158,14 +158,12 @@ func ZSTDUploadReader(b Buffer) (io.ReadCloser, bool) {
 	return nil, false
 }
 
-// StageCASUpload keeps source retries and completion ownership around receiving
-// and validating a whole representation. The callback resets its destination
-// for each attempt, consumes and closes the source, and uses the supplied
-// logical-reader factory to validate local staged bytes before returning.
-// Nothing may be published until this call succeeds. Source references remain
-// owned by the callback until validation finishes, including integrity callbacks.
-func StageCASUpload(ctx context.Context, b Buffer, stage func(io.ReadCloser, func(io.ReadCloser) io.ReadCloser) error) error {
-	err := stageCASUpload(ctx, b, stage)
+// ConsumeCASUpload validates a streaming upload using the destination's codec
+// pool while retaining source retries, integrity callbacks, and completion.
+// Each retry invokes consume with the entire replacement. The callback must
+// reset its output, close the reader, and publish nothing before success.
+func ConsumeCASUpload(ctx context.Context, b Buffer, pool zstd.Pool, consume func(Buffer) error) error {
+	err := consumeCASUpload(ctx, b, pool, consume)
 	var destination *UploadDestinationError
 	if errors.As(err, &destination) {
 		return destination.Err
@@ -180,7 +178,7 @@ type UploadDestinationError struct{ Err error }
 func (e *UploadDestinationError) Error() string { return e.Err.Error() }
 func (e *UploadDestinationError) Unwrap() error { return e.Err }
 
-func stageCASUpload(ctx context.Context, b Buffer, stage func(io.ReadCloser, func(io.ReadCloser) io.ReadCloser) error) error {
+func consumeCASUpload(ctx context.Context, b Buffer, pool zstd.Pool, consume func(Buffer) error) error {
 	if err := ctx.Err(); err != nil {
 		b.Discard()
 		return status.FromContextError(err).Err()
@@ -190,7 +188,7 @@ func stageCASUpload(ctx context.Context, b Buffer, stage func(io.ReadCloser, fun
 		defer b.errorHandler.Done()
 		base := b.base
 		for {
-			err := stageCASUpload(ctx, base, stage)
+			err := consumeCASUpload(ctx, base, pool, consume)
 			var destination *UploadDestinationError
 			if err == nil || err == io.EOF || ctx.Err() != nil || errors.As(err, &destination) {
 				return err
@@ -201,29 +199,28 @@ func stageCASUpload(ctx context.Context, b Buffer, stage func(io.ReadCloser, fun
 			}
 		}
 	case *casBufferWithBackgroundTask:
-		err := stageCASUpload(ctx, b.base, stage)
+		err := consumeCASUpload(ctx, b.base, pool, consume)
 		<-b.task.completion
 		if err != nil {
 			return err
 		}
 		return b.task.err
 	case *deferredCASBuffer:
-		return stageCASUpload(ctx, b.resolve(), stage)
+		return consumeCASUpload(ctx, b.resolve(), pool, consume)
 	case *compressedBuffer:
 		r, err := b.encodedReader()
 		if err != nil {
 			return err
 		}
-		return stage(r, func(local io.ReadCloser) io.ReadCloser {
-			copy := *b
-			copy.ctx = ctx
-			copy.encoded = local
-			copy.stored = nil
-			copy.readEncoded = nil
-			return copy.ToReader()
-		})
+		copy := *b
+		copy.ctx = ctx
+		copy.pool = pool
+		copy.encoded = zstd.LimitUpload(r, b.digest.GetSizeBytes())
+		copy.stored = nil
+		copy.readEncoded = nil
+		return consume(&copy)
 	default:
-		return stage(b.ToReader(), func(local io.ReadCloser) io.ReadCloser { return local })
+		return consume(b)
 	}
 }
 

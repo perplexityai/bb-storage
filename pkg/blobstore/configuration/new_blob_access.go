@@ -151,14 +151,22 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 		}, "mirrored", nil
 	case *pb.BlobAccessConfiguration_Local:
 		compression := backend.Local.CasCompression
-		var compressionPool bb_zstd.Pool
+		var compressionPool, uploadPool bb_zstd.Pool
 		if compression != nil {
 			casCreator, ok := creator.(*casBlobAccessCreator)
 			if !ok || backend.Local.GetBlocksOnBlockDevice() == nil {
 				return BlobAccessInfo{}, "", status.Error(codes.InvalidArgument, "CAS compression requires block-device CAS storage")
 			}
 			compressionPool = casCreator.zstdPool
+			var err error
+			uploadPool, err = bb_zstd.NewUploadPoolFromConfiguration(compression.UploadZstdPool, compression.MaximumConcurrentWrites)
+			if err != nil {
+				return BlobAccessInfo{}, "", err
+			}
 			if err := blobstore.ValidateCompressedCASConfiguration(compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, compressionPool); err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+			if err := bb_zstd.ValidatePoolCompatibility(uploadPool, compressionPool, 1<<20); err != nil {
 				return BlobAccessInfo{}, "", err
 			}
 		}
@@ -386,7 +394,7 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			)
 		}
 		if compression != nil {
-			localBlobAccess, err = blobstore.NewCompressedCASBlobAccess(localBlobAccess, compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, compressionPool)
+			localBlobAccess, err = blobstore.NewCompressedCASBlobAccess(localBlobAccess, compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, uploadPool)
 			if err != nil {
 				return BlobAccessInfo{}, "", err
 			}
