@@ -75,6 +75,10 @@ func localStorageMode(t *testing.T, p *observedPool, compressed, hierarchical bo
 }
 
 func localStorageSized(t *testing.T, p *observedPool, compressed, hierarchical bool, deviceBytes int64) (blobstore.BlobAccess, string, string) {
+	return localStorageBudgeted(t, p, compressed, hierarchical, deviceBytes, 128<<20, 2)
+}
+
+func localStorageBudgeted(t *testing.T, p *observedPool, compressed, hierarchical bool, deviceBytes, stagedBytes, writes int64) (blobstore.BlobAccess, string, string) {
 	t.Helper()
 	dir := t.TempDir()
 	path := filepath.Join(dir, "blocks")
@@ -83,8 +87,8 @@ func localStorageSized(t *testing.T, p *observedPool, compressed, hierarchical b
 	"keyLocationMap":{"inMemory":{"entries":"1024"},"maximumGetAttempts":16,"maximumPutAttempts":"64"},
 	"blocksOnBlockDevice":{"source":{"file":{"path":%q,"sizeBytes":"%d"}},"spareBlocks":2},
 	"oldBlocks":1,"currentBlocks":1,"newBlocks":1,
-	"casCompression":{"stagingDirectory":%q,"maximumStagedBytes":"134217728","maximumConcurrentWrites":"2"}
-	}}`, path, deviceBytes, dir)), &config))
+	"casCompression":{"stagingDirectory":%q,"maximumStagedBytes":"%d","maximumConcurrentWrites":"%d"}
+	}}`, path, deviceBytes, dir, stagedBytes, writes)), &config))
 	if !compressed {
 		config.GetLocal().CasCompression = nil
 	}
@@ -269,10 +273,10 @@ func testCompressedPrimaryStorage(t *testing.T, hierarchical bool) {
 	require.Len(t, entries, 1, "staging files must be unlinked")
 }
 
-func TestLegacyAndCorruptStorage(t *testing.T) {
+func TestTinyRawAndCorruptStorage(t *testing.T) {
 	p := pool()
 	factory := blobstore.NewCompressedCASReadBufferFactory(p)
-	data := bytes.Repeat([]byte("legacy raw record"), 100)
+	data := bytes.Repeat([]byte("tiny raw record"), 100)
 	d := digestOf(data)
 	var results []bool
 	callback := func(valid bool) { results = append(results, valid) }
@@ -334,6 +338,7 @@ func TestFailedUploadsAreNotPublished(t *testing.T) {
 	_, err = blobstore.NewCompressedCASBlobAccess(storage, dir, 1, 1, p)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
 	minimum, _ := zstdframes.MaximumStoredSize(0, 1<<20)
+	minimum += bb_zstd.MaximumUploadSize(0)
 	limited, err := blobstore.NewCompressedCASBlobAccess(storage, dir, minimum, 1, p)
 	require.NoError(t, err)
 	newData := []byte("not already present")

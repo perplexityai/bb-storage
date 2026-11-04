@@ -39,15 +39,29 @@ early successful response as a failed send. Close and background-task errors
 remain observable. Duplicate detection runs inside the authorized storage Put
 path; failures refreshing an existing record do not prevent a repair upload.
 
-New uploads reserve one write slot and a conservative bound on staging bytes:
-encoded expansion plus metadata proportional to frame count. Empty blobs reserve
-about 2 KiB rather than the maximum index budget. Configuration too small for one
-record is rejected before opening the device. A blob that can never fit returns
-`INVALID_ARGUMENT`; temporary slot or byte-budget contention returns
-`RESOURCE_EXHAUSTED`. Admission remains fail-fast, with no unbounded waiting queue.
-An unlinked temporary file receives the representation. Validation must finish
-before local allocation publishes it. A crash between file creation and unlink
-can leave an empty named file; payload writes begin only after unlink succeeds.
+Uploads reserve space for both received input and the encoded output plus index.
+Input is received completely into an unlinked file before acquiring a decoder or
+processing slot. Slow upload clients therefore consume bounded disk staging and
+request capacity, not codecs needed by reads. `maximumConcurrentWrites` bounds
+local validation/encoding; at most four times that many requests may receive or
+wait. Byte-budget and processing waits last at most 30 seconds, or the caller's
+deadline if earlier. A full request queue or expired capacity wait returns
+`RESOURCE_EXHAUSTED`; caller cancellation retains its own status. Requests already
+converted to logical streams by an upstream consumer may still own that consumer's
+decoder; staging cannot undo earlier decoding.
+
+The reservation includes worst-case input and output simultaneously, roughly
+2.25 times logical size plus framing/index overhead. Size the budget for concurrent
+maximum-sized blobs, not just their compressed average. With the 1 GiB example,
+one 256 MiB blob fits but two such worst-case reservations do not; a 2 GiB budget
+admits three. A blob that can never fit returns `INVALID_ARGUMENT`. Configuration
+too small for even an empty upload fails before opening the block device.
+
+Whole-input retries restart both staging files, preserving source error handlers,
+backend integrity callbacks, and completion errors through local validation.
+Nothing is published until every validation and completion check succeeds. A
+crash between file creation and unlink can leave an empty named file; payload
+writes begin only after unlink succeeds.
 
 Allocation and refresh use the physical record length; CAS keys and API sizes
 remain logical. Refresh verifies the compressed representation without codecs.
@@ -65,9 +79,10 @@ download fast path. Storage decodes once and encodes the indexed frames; the
 frontend uses no codecs. Identity-only hops and intermediate consumers that need
 logical bytes retain the validating decode/encode fallback.
 
-## Compatibility and fallback behavior
+## Read behavior and fresh-store requirement
 
-- Existing raw records remain readable and receive normal logical validation.
+- Start with an empty store. Unindexed raw records larger than 4 KiB are rejected.
+  Tiny raw records produced by this mode receive bounded logical validation.
 - Full compressed reads verify each stored frame's encoded checksum before
   exposing its bytes. Trusted backend streams retain their encoded representation
   at the frontend; the final client must validate the logical digest.
@@ -85,21 +100,16 @@ logical bytes retain the validating decode/encode fallback.
   Retrying decorators use the logical fallback: compressed byte offsets are not
   safely interchangeable between different encodings of the same blob.
 - Block-device integrity-cache shortcuts are disabled in compressed mode. Encoded
-  checksums and legacy logical validation remain enabled.
+  checksums and tiny-record logical validation remain enabled.
 - Existing REAPI digest and ByteStream APIs are unchanged. No chunk-discovery or
   content-defined-chunking capability is advertised. Independent frame reads in
   this package are not a protocol for clients to discover parallel downloads.
 
-This is a storage-format rollout. **Older raw-only readers cannot read compressed
-records.** Keep a compatible reader and `casCompression` configured after enabling
-writes, or retire the affected cache data before reverting to an older binary.
-Disabling the option is not a safe rollback of a populated compressed store:
-raw-only validation may invalidate the containing block and all older blocks,
-losing unrelated cache records. A recognized newer footer version returns
-`FAILED_PRECONDITION` without invalidation. A read-compressed/write-raw migration
-mode is not implemented; stopping compressed writes alone would not make existing
-compressed records readable by an older binary.
-Changing shard configuration or deploying this code is a separate operator action.
+This mode requires a fresh cache. There is no migration or read-compressed/write-raw
+mode. Retire the cache data before changing back to raw-only storage or an
+incompatible format. A recognized unsupported footer version returns
+`FAILED_PRECONDITION` without invalidation. Changing shard configuration or
+deploying this code is a separate operator action.
 
 ## Format integrity and bounds
 
@@ -119,37 +129,39 @@ limit. Indexed incompressible records may occupy slightly more space than raw
 bytes. Built-in encoders use known-size encoding; a 1 MiB frame does
 not require the default streaming encoder's 8 MiB history window. Keep the decoder
 window limit at least 1 MiB for default integrated stored frames. Smaller configured
-encoder windows are respected rather than enlarged by single-segment encoding. Previously written
-streaming frames may require a larger window until those records have aged out.
-Custom streaming-only codec implementations retain their own frame settings.
+encoder windows are respected rather than enlarged by single-segment encoding. Custom streaming-only codec implementations retain their own frame settings.
 
 `Reader` supports concurrent frame reads when its immutable backing `ReaderAt`
 does. Its owner must keep that backing object alive through all readers. The local
 buffer implementation pins block references across clones and refreshes. Opening
 and validating the index is deferred until consumption, outside the local store
 metadata lock; construction, size queries, and cloning do not read the device.
+Each read factory has a 64 MiB LRU budget for verified indexes. Hits read the footer
+but skip index I/O and JSON parsing; frame checksums are always verified. Entries
+include content digest, physical size, and the footer checksum. They retain no
+file handles, block references, or instance names. Eviction and oversized indexes
+fall back to normal bounded parsing. Returned readers can keep an evicted index
+alive until those requests finish; normal request admission must also bound active
+read memory.
 Device I/O errors, including `DATA_LOSS` and short reads, do not by themselves
 prove corruption. Only verified format/checksum failures invalidate blocks.
 
-## Remaining operational limits
+## Encoded ingress and operational bounds
 
-A write slot spans the upload, and a compressed upload still owns its decoder
-while receiving client bytes. Slow clients can exhaust write slots; reserve
-read-side decoder headroom above concurrent uploads and configure request
-admission and deadlines. Encoder-pool size alone does not bound buffered transport
-memory. Separating upload decoder capacity or staging encoded input before decoding
-requires a distinct resource policy and workload measurements.
+Compressed upload ingress is limited to logical size plus 12.5%, 1 KiB per logical
+MiB (rounded up, minimum one), and 1 KiB fixed overhead. The frontend checks this
+while forwarding, without acquiring codecs. Storage applies the same bound to
+staged input, including compressed replication streams. Excess input returns
+`INVALID_ARGUMENT`, including oversized duplicates. This is an explicit upload
+policy: otherwise legal Zstandard streams containing excessive empty or skippable
+frames are rejected. Existing logical blob-size limits remain independent.
 
-Legacy raw records still receive full logical validation on partial reads;
-`dataIntegrityValidationCache` is deliberately bypassed in compressed mode. Large
-legacy records can therefore be expensive for worker-local random reads during
-migration. Compressed records use the indexed path. The JSON index is parsed per
-read; maximum-format-size workloads still need memory and latency measurements.
-
-Logical upload limits do not cap encoded byte volume. Zstandard permits legal
-empty and skippable frames, so a digest-derived encoded-size cap would be an
-additional accepted-upload policy. No such cap is imposed here. It must be chosen
-and tested explicitly before exposing this path to untrusted or unbounded senders.
+Slow clients can still fill the finite receive queue or staging budget. Configure
+RPC admission/deadlines and size staging for the intended concurrent workload;
+overload remains a bounded rejection, not unlimited buffering. Staging adds local
+disk I/O and delays encoding until receive completion. Encoder-pool size alone
+does not bound transport memory. Read-side logical consumers and synchronized
+logical replication clones may still decode network streams as they consume them.
 
 ## Verification
 
@@ -161,13 +173,13 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
 - Full compressed reads return exactly the stored frames with zero codec leases.
 - Flat and hierarchical block refreshes preserve those bytes and avoid codecs.
 - Compressed uploads use no frontend codecs; storage validates and frames once.
-- Legacy compressed clients finish duplicate uploads without codec acquisition
-  at storage. Duplicate streams are drained for compatibility.
+- Duplicate compressed uploads drain without codec acquisition at storage and
+  share the bounded receive queue.
 - Aligned compressed offsets use no codecs; partial first frames use one decoder
   and encoder at storage and none at the frontend. Identity reads remain correct.
 - Truncated uploads, digest/size mismatches, authorization failures, and upload
   limits are enforced with compressed and identity-only internal hops.
-- Source failures cancel backend codec waits promptly. Early backend rejection
+- Source failures cancel raw-backend codec waits promptly. Early backend rejection
   interrupts paused upload reads and frontend codec waits, even before the client
   supplies bytes or closes its send side. Both identity and compressed forwarding
   preserve source-close and background-task errors.
@@ -180,12 +192,21 @@ authorization, metrics, and sharding over in-process gRPC connections. It checks
   versions do not evict records. Isolated metadata mutations cover digest identity,
   digest function, physical gaps, and decoded frame hashes.
 - Metrics-wrapped random and offset reads touch only the requested frames.
-  Resolved legacy clones can be consumed sequentially, and cloned streams retain
+  Resolved tiny-record clones can be consumed sequentially, and cloned streams retain
   terminal close errors. Physical refresh buffers reject alternate data access.
 - Denied instances, corrupt frames/indexes, and invalid uploads fail correctly.
 - Retrying a disconnected source resumes at the logical offset with another
   compressed encoding, without holding the encoder during source replacement.
 - Failed uploads release staging resources; copying to raw storage stays logical.
+- Stalled metrics-wrapped encoded inputs consume no codec or processing slot;
+  a one-decoder pool still serves reads and another write.
+- Staging contention waits, honors cancellation, and admits work after release.
+- Malformed primary streams retry from a complete replacement encoding, retaining
+  backend integrity attribution and source lifetime through validation.
+- Excess encoded padding is rejected without codecs at the frontend and on
+  duplicate uploads. Exact-budget streams and terminal source errors are covered.
+- Index-cache hits use the current backing reader, verify frame corruption, retain
+  the caller's instance only for its active reader, and obey LRU eviction.
 - Explicit truncated-stream errors and errors accompanying a full chunk remain
   failures; storage `OutOfRange` errors are not interpreted as frame exhaustion.
 - Fallback replication releases the failed decoder before acquiring its
@@ -205,7 +226,6 @@ the configured 4 MiB batch size. The same probe rejected an oversized cache
 upload without failing the local build or publishing an incomplete Action Cache
 entry. This does not establish compatibility with every remote-execution worker.
 
-A persistent-daemon restart check also verifies mixed raw and compressed records:
-write raw data, restart with compression enabled, write compressed data, then
-restart again and reconstruct both through identity and compressed reads. This
-covers graceful restart, not abrupt-power-loss durability.
+The current mode requires a fresh store; old raw-record migration probes are not
+compatibility guarantees. Graceful-restart and abrupt-power-loss behavior need
+separate durability validation.

@@ -610,9 +610,9 @@ message LocalBlobAccessConfiguration {
   bool hierarchical_instance_names = 14;
 
   // When configured for block-device CAS storage, new blobs use compressed
-  // primary records. Legacy raw records remain readable. Whole compressed
-  // reads can be forwarded without codecs. Existing uncompressed readers
-  // cannot read the new records, so rolling back requires a compatible reader.
+  // primary records. Start with an empty store; only tiny raw records produced
+  // by this mode are supported. Whole compressed reads need no codecs.
+  // Changing storage mode requires retiring existing cache data.
   // Encoded checksum validation is always enabled; the block device's
   // data_integrity_validation_cache is not applied in this mode.
   CASCompression cas_compression = 16;
@@ -622,10 +622,12 @@ message LocalBlobAccessConfiguration {
     // Do not place this on a memory-backed filesystem.
     string staging_directory = 1;
     // Bounds reserved temporary disk bytes across active uploads, including
-    // worst-case encoded expansion and index overhead. Required and positive.
+    // both received input and worst-case output with its index. Must accommodate
+    // at least one complete upload; size for concurrent maximum-sized blobs.
     int64 maximum_staged_bytes = 2;
-    // Independent bound on active compression/staging requests. Excess work
-    // is rejected before receiving any blob bytes. Required and positive.
+    // Bounds processing of completely received inputs. Receiving and queued
+    // requests are separately bounded to four times this value. Capacity waits
+    // last at most 30 seconds, or the caller deadline if earlier.
     int64 maximum_concurrent_writes = 3;
   }
 }

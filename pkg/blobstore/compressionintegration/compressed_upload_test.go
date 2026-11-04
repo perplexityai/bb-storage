@@ -203,13 +203,13 @@ func (r *failingUploadReader) Read(p []byte) (int, error) {
 }
 func (*failingUploadReader) Close() error { return nil }
 
-func TestUploadSourceFailureCancelsBackendCodecWait(t *testing.T) {
+func TestUploadSourceFailureCancelsRawBackendCodecWait(t *testing.T) {
 	storagePool, frontendPool := pool(), pool()
 	held, err := storagePool.NewDecoder(t.Context(), nil)
 	require.NoError(t, err)
 	defer held.Close()
 	waiting := &waitingDecoderPool{Pool: storagePool, attempted: make(chan struct{})}
-	storage, _, _ := localStorage(t, storagePool)
+	storage, _, _ := localStorageMode(t, storagePool, false, false)
 	client := grpcclients.NewCASBlobAccess(serve(t, storage, waiting), uuid.NewRandom, 4096, frontendPool)
 	d := digestOf([]byte("hello"))
 	ctx, cancel := context.WithCancel(t.Context())

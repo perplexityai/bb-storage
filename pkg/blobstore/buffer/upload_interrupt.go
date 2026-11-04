@@ -19,6 +19,10 @@ func UploadReadInterrupt(b Buffer) func() {
 		return uploadReadInterrupt(b.r)
 	case *casBufferWithBackgroundTask:
 		return UploadReadInterrupt(b.base)
+	case *casErrorHandlingBuffer:
+		if _, ok := b.errorHandler.(NonRetryingErrorHandler); ok {
+			return UploadReadInterrupt(b.base)
+		}
 	}
 	return nil
 }

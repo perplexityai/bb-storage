@@ -5,6 +5,7 @@ go_test(
     srcs = [
         "compressed_storage_test.go",
         "compressed_upload_test.go",
+        "resource_limits_test.go",
         "review_feedback_test.go",
         "review_regression_test.go",
         "upload_completion_test.go",

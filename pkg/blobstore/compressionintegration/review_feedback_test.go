@@ -179,8 +179,8 @@ func TestRefreshRejectsAlternateConsumers(t *testing.T) {
 	require.Equal(t, out.Bytes(), copied.Bytes())
 }
 
-func TestResolvedLegacyCloneCopyIsIndependent(t *testing.T) {
-	data := []byte("legacy record")
+func TestResolvedTinyRawCloneCopyIsIndependent(t *testing.T) {
+	data := []byte("tiny raw record")
 	d := digestOf(data)
 	b := blobstore.NewCompressedCASReadBufferFactory(pool()).NewBufferFromByteSlice(d, data, func(bool) {})
 	_, encoded := buffer.ZSTDChunkReader(b, 4096)

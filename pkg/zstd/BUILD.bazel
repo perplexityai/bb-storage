@@ -12,6 +12,7 @@ go_library(
         "pool.go",
         "read_closer.go",
         "unbounded_pool.go",
+        "upload_limit.go",
     ],
     importpath = "github.com/buildbarn/bb-storage/pkg/zstd",
     visibility = ["//visibility:public"],
@@ -32,10 +33,13 @@ go_test(
     srcs = [
         "bounded_pool_test.go",
         "copy_test.go",
+        "upload_limit_test.go",
     ],
     deps = [
         ":zstd",
         "@com_github_klauspost_compress//zstd",
         "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
     ],
 )

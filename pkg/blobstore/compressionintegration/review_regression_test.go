@@ -38,12 +38,12 @@ func (r *countedRecordReader) Close() error { r.closes.Add(1); return nil }
 
 func TestCompressedReadFactoryDefersIOAndPinsClones(t *testing.T) {
 	p := pool()
-	data := bytes.Repeat([]byte("lazy index"), 1000)
+	data := bytes.Repeat([]byte("lazy index"), 100)
 	d := digestOf(data)
 	var encoded bytes.Buffer
 	require.NoError(t, zstdframes.Encode(t.Context(), &encoded, d, bytes.NewReader(data), 4096, p))
 	for _, raw := range []bool{false, true} {
-		t.Run(map[bool]string{false: "compressed", true: "legacy"}[raw], func(t *testing.T) {
+		t.Run(map[bool]string{false: "compressed", true: "tiny_raw"}[raw], func(t *testing.T) {
 			record := encoded.Bytes()
 			if raw {
 				record = data
