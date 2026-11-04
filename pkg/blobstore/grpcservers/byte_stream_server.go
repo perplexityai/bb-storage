@@ -97,7 +97,7 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 		}
 		r := buffer.NewReaderFromChunkReader(b.ToChunkReader(in.ReadOffset, s.readChunkSize))
 		defer r.Close()
-		return bb_zstd.Copy(ctx, s.zstdPool, &readStreamWriter{out: out}, r)
+		return bb_zstd.CopySized(ctx, s.zstdPool, &readStreamWriter{out: out}, r, digest.GetSizeBytes()-in.ReadOffset)
 
 	default:
 		return status.Errorf(codes.Unimplemented, "This service does not support downloading compression type: %s", compressor)

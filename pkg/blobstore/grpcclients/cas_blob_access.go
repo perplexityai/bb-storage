@@ -219,7 +219,7 @@ func (ba *casBlobAccess) Put(ctx context.Context, digest digest.Digest, b buffer
 	copyErr := w.sendError
 	if copyErr == nil {
 		if useCompression && !encoded {
-			copyErr = bb_zstd.Copy(copyCtx, ba.zstdPool, w, r)
+			copyErr = bb_zstd.CopySized(copyCtx, ba.zstdPool, w, r, digest.GetSizeBytes())
 		} else {
 			// Hide WriterTo so every transport message respects readChunkSize.
 			_, copyErr = io.CopyBuffer(w, struct{ io.Reader }{r}, make([]byte, ba.readChunkSize))

@@ -3,9 +3,6 @@ package zstd
 import (
 	"context"
 	"io"
-
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // Copy writes independent Zstandard frames, reading at most one MiB before
@@ -13,7 +10,13 @@ import (
 // particular, source retries may acquire decoders without holding an encoder
 // from the same bounded pool. The caller owns both I/O handles.
 func Copy(ctx context.Context, pool Pool, dst io.Writer, src io.Reader) error {
-	data := make([]byte, 1<<20)
+	return CopySized(ctx, pool, dst, src, 1<<20)
+}
+
+// CopySized bounds the input frame buffer using the expected logical size.
+// The size is a buffer hint; callers retain responsibility for size validation.
+func CopySized(ctx context.Context, pool Pool, dst io.Writer, src io.Reader, sizeHint int64) error {
+	data := make([]byte, min(int64(1<<20), max(int64(1), sizeHint)))
 	first := true
 	for {
 		size, emptyReads := 0, 0
@@ -57,23 +60,16 @@ func Copy(ctx context.Context, pool Pool, dst io.Writer, src io.Reader) error {
 			return nil
 		}
 		first = false
-		encoder, err := pool.NewEncoder(ctx, dst)
+		encoded, err := EncodeFrame(ctx, pool, data[:size])
 		if err != nil {
-			if code := status.Code(err); code == codes.Canceled || code == codes.DeadlineExceeded {
-				return err
-			}
-			return status.Errorf(codes.ResourceExhausted, "Failed to acquire ZSTD encoder: %v", err)
+			return err
 		}
-		n, writeErr := encoder.Write(data[:size])
-		closeErr := encoder.Close()
-		if writeErr != nil {
-			return writeErr
+		n, err := dst.Write(encoded)
+		if err != nil {
+			return err
 		}
-		if n != size {
+		if n != len(encoded) {
 			return io.ErrShortWrite
-		}
-		if closeErr != nil {
-			return closeErr
 		}
 		if err := ctx.Err(); err != nil {
 			return contextError(ctx)

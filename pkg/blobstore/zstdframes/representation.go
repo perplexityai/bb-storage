@@ -34,6 +34,14 @@ const (
 // or invalidate the containing storage block.
 var ErrInvalidRepresentation = status.Error(codes.DataLoss, "Invalid compressed representation index")
 
+// ErrUnsupportedVersion does not establish corruption of a record written by
+// a newer binary. Callers must not evict its containing block.
+var ErrUnsupportedVersion = status.Error(codes.FailedPrecondition, "Unsupported compressed representation version")
+
+// ErrCorruptFrame identifies checksum failures established from stored bytes,
+// independently of status codes returned by the backing device.
+var ErrCorruptFrame = status.Error(codes.DataLoss, "Compressed frame integrity check failed")
+
 type frame struct {
 	Hash        string `json:"hash"`
 	Size        int64  `json:"size"`
@@ -104,10 +112,15 @@ func MaximumStoredSize(size int64, frameSize int) (int64, error) {
 		count += (size - 1) / int64(frameSize)
 	}
 	if count > maximumFrames {
-		return 0, status.Error(codes.ResourceExhausted, "Blob requires too many frames")
+		return 0, status.Error(codes.InvalidArgument, "Blob requires too many frames")
 	}
-	return count*encodedLimit(frameSize) + maximumIndexSize + footerSize, nil
+	// Every frame has bounded hashes, integer fields and fixed JSON keys.
+	// Charge actual logical bytes, including a short final frame, rather than
+	// a complete frame and the maximum index for every tiny upload.
+	return size + size/8 + count*1024 + indexBudget(count) + footerSize, nil
 }
+
+func indexBudget(frames int64) int64 { return min(maximumIndexSize, 512+512*frames) }
 
 func encodedLimit(frameSize int) int64 {
 	return int64(frameSize + frameSize/8 + 1024)
@@ -118,18 +131,6 @@ func checkContext(ctx context.Context) error {
 		return status.FromContextError(err).Err()
 	}
 	return nil
-}
-
-type boundedWriter struct {
-	bytes.Buffer
-	limit int64
-}
-
-func (w *boundedWriter) Write(p []byte) (int, error) {
-	if int64(len(p)) > w.limit-int64(w.Len()) {
-		return 0, status.Error(codes.ResourceExhausted, "Compressed frame exceeds its size budget")
-	}
-	return w.Buffer.Write(p)
 }
 
 func writeAll(w io.Writer, p []byte) error {
@@ -178,25 +179,14 @@ func (r *terminalErrorReader) Read(p []byte) (int, error) {
 }
 
 func compressFrame(ctx context.Context, data []byte, frameSize int, pool zstd.Pool) ([]byte, error) {
-	if len(data) == 0 {
-		// Pool encoders may suppress empty frames. Emit a single-segment frame
-		// with content size zero and one final empty raw block (RFC 8878, 3.1.1).
-		return []byte{0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00}, nil
-	}
-	encoded := boundedWriter{limit: encodedLimit(frameSize)}
-	encoder, err := pool.NewEncoder(ctx, &encoded)
+	encoded, err := zstd.EncodeFrame(ctx, pool, data)
 	if err != nil {
 		return nil, err
 	}
-	writeErr := writeAll(encoder, data)
-	closeErr := encoder.Close()
-	if writeErr != nil {
-		return nil, writeErr
+	if int64(len(encoded)) > encodedLimit(frameSize) {
+		return nil, status.Error(codes.ResourceExhausted, "Compressed frame exceeds its size budget")
 	}
-	if closeErr != nil {
-		return nil, closeErr
-	}
-	return encoded.Bytes(), nil
+	return encoded, nil
 }
 
 // Encode writes a versioned representation, validating the entire logical
@@ -214,11 +204,11 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 	}
 	size := d.GetSizeBytes()
 	if size > int64(frameSize)*maximumFrames {
-		return status.Error(codes.ResourceExhausted, "Blob requires too many frames")
+		return status.Error(codes.InvalidArgument, "Blob requires too many frames")
 	}
 	idx := index{Hash: d.GetHashString(), Size: size, Function: d.GetDigestFunction().GetEnumValue(), FrameSize: frameSize}
 	whole := d.GetDigestFunction().NewGenerator(size)
-	data := make([]byte, frameSize)
+	data := make([]byte, min(int64(frameSize), size))
 	source := terminalErrorReader{source: src}
 	var offset int64
 	for remaining := size; remaining > 0 || len(idx.Frames) == 0; {
@@ -228,6 +218,9 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 		n := min(int64(frameSize), remaining)
 		p := data[:int(n)]
 		if _, err := io.ReadFull(&source, p); err != nil {
+			if (err == io.EOF || err == io.ErrUnexpectedEOF) && source.err == io.EOF {
+				return status.Error(codes.InvalidArgument, "Blob is shorter than its declared size")
+			}
 			return err
 		}
 		// ReadFull drops errors delivered with exactly len(p) bytes. Retain
@@ -274,7 +267,7 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 	if err != nil {
 		return err
 	}
-	if len(metadata) > maximumIndexSize {
+	if int64(len(metadata)) > indexBudget(int64(len(idx.Frames))) {
 		return status.Error(codes.ResourceExhausted, "Frame index exceeds its size budget")
 	}
 	if err := writeWithContext(ctx, dst, metadata); err != nil {
@@ -302,6 +295,9 @@ func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, erro
 	var footer [footerSize]byte
 	if err := readAtFull(source, footer[:], size-footerSize); err != nil {
 		return nil, err
+	}
+	if string(footer[:6]) == "BBZSTF" && string(footer[:8]) != magic {
+		return nil, ErrUnsupportedVersion
 	}
 	length := binary.LittleEndian.Uint64(footer[8:16])
 	if string(footer[:8]) != magic || length > maximumIndexSize || length > uint64(size-footerSize) {
@@ -393,7 +389,7 @@ func (r *Reader) ReadCompressedFrame(ctx context.Context, i int) ([]byte, error)
 	}
 	h := sha256.Sum256(data)
 	if hex.EncodeToString(h[:]) != f.EncodedHash {
-		return nil, status.Error(codes.DataLoss, "Compressed frame checksum mismatch")
+		return nil, ErrCorruptFrame
 	}
 	if err := checkContext(ctx); err != nil {
 		return nil, err
@@ -448,19 +444,21 @@ func (r *Reader) ReadFrameAt(ctx context.Context, offset int64, compressed bool,
 	if pool == nil {
 		return nil, offset, status.Error(codes.InvalidArgument, "Decoding requires a codec pool")
 	}
-	decoder, err := pool.NewDecoder(ctx, bytes.NewReader(encoded))
-	if err != nil {
-		return nil, offset, err
-	}
-	data, readErr := io.ReadAll(io.LimitReader(decoder, f.Size+1))
-	decoder.Close()
+	data, readErr := func() ([]byte, error) {
+		decoder, err := pool.NewDecoder(ctx, bytes.NewReader(encoded))
+		if err != nil {
+			return nil, err
+		}
+		defer decoder.Close()
+		return io.ReadAll(io.LimitReader(decoder, f.Size+1))
+	}()
 	if readErr != nil {
 		return nil, offset, readErr
 	}
 	g := r.digest.GetDigestFunction().NewGenerator(f.Size)
 	g.Write(data)
 	if int64(len(data)) != f.Size || g.Sum().GetHashString() != f.Hash {
-		return nil, offset, status.Error(codes.DataLoss, "Decoded frame digest mismatch")
+		return nil, offset, ErrCorruptFrame
 	}
 	if err := checkContext(ctx); err != nil {
 		return nil, offset, err

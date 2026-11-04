@@ -296,7 +296,7 @@ func TestEncodingBudgetsAndIndexEntryLimit(t *testing.T) {
 	for _, size := range []int{0, 4095, (4 << 20) + 1} {
 		require.Equal(t, codes.InvalidArgument, status.Code(zstdframes.Encode(context.Background(), io.Discard, d, errorReader{errSource}, size, pool)))
 	}
-	require.Equal(t, codes.ResourceExhausted, status.Code(zstdframes.Encode(context.Background(), io.Discard, tooLarge, errorReader{errSource}, 4096, pool)))
+	require.Equal(t, codes.InvalidArgument, status.Code(zstdframes.Encode(context.Background(), io.Discard, tooLarge, errorReader{errSource}, 4096, pool)))
 	require.Zero(t, pool.encoders.Load())
 	encoded, d := encode(t, []byte("small"), 4096, pool)
 	bad := rewriteIndex(t, encoded, func(m map[string]any) {
@@ -485,4 +485,68 @@ func BenchmarkRepresentationReads(b *testing.B) {
 			}
 		}
 	})
+}
+
+func TestIndependentIndexIdentityChecks(t *testing.T) {
+	data := bytes.Repeat([]byte("identity"), 1000)
+	encoded, d := encode(t, data, 4096, newPool())
+	wrong := blobDigest(bytes.Repeat([]byte("y"), len(data)), remoteexecution.DigestFunction_SHA256)
+	_, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), wrong)
+	require.Equal(t, codes.DataLoss, status.Code(err), "same-sized foreign blob must not be accepted")
+	bad := rewriteIndex(t, encoded, func(m map[string]any) { m["function"] = float64(remoteexecution.DigestFunction_SHA1) })
+	_, err = zstdframes.Open(bytes.NewReader(bad), int64(len(bad)), d)
+	require.Equal(t, codes.DataLoss, status.Code(err))
+	footer := encoded[len(encoded)-48:]
+	indexStart := len(encoded) - 48 - int(binary.LittleEndian.Uint64(footer[8:16]))
+	gap := append(append(bytes.Clone(encoded[:indexStart]), 0), encoded[indexStart:]...)
+	_, err = zstdframes.Open(bytes.NewReader(gap), int64(len(gap)), d)
+	require.Equal(t, codes.DataLoss, status.Code(err), "unindexed frame-region bytes must be rejected")
+	bad = rewriteIndex(t, encoded, func(m map[string]any) { m["frames"].([]any)[0].(map[string]any)["hash"] = wrong.GetHashString() })
+	index, err := zstdframes.Open(bytes.NewReader(bad), int64(len(bad)), d)
+	require.NoError(t, err, "well-formed metadata must reach decoded-frame validation")
+	_, _, err = index.ReadFrameAt(t.Context(), 0, false, newPool())
+	require.ErrorIs(t, err, zstdframes.ErrCorruptFrame)
+}
+
+func TestFrameWindowAndProportionalReservation(t *testing.T) {
+	pool := bb_zstd.NewBoundedPool(1, 1, []zstd.EOption{zstd.WithEncoderConcurrency(1)}, []zstd.DOption{zstd.WithDecoderMaxWindow(1 << 20), zstd.WithDecoderConcurrency(1)})
+	for _, size := range []int{0, 1, 4095, 4096, 4097, 1 << 20} {
+		data := bytes.Repeat([]byte("x"), size)
+		encoded, d := encode(t, data, 1<<20, pool)
+		reservation, err := zstdframes.MaximumStoredSize(int64(size), 1<<20)
+		require.NoError(t, err)
+		require.LessOrEqual(t, int64(len(encoded)), reservation)
+		require.Less(t, reservation, int64(size)+int64(size)/8+4096)
+		index, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
+		require.NoError(t, err)
+		frame, err := index.ReadCompressedFrame(t.Context(), 0)
+		require.NoError(t, err)
+		var header zstd.Header
+		require.NoError(t, header.Decode(frame))
+		if size == 0 || size == 1<<20 {
+			require.True(t, header.HasFCS)
+			require.EqualValues(t, size, header.FrameContentSize)
+		}
+		require.LessOrEqual(t, header.WindowSize, uint64(max(size, 1024)))
+		var out bytes.Buffer
+		require.NoError(t, index.WriteIdentity(t.Context(), &out, 0, pool))
+		require.True(t, bytes.Equal(data, out.Bytes()))
+	}
+}
+
+func TestFrameEncodingRespectsConfiguredWindow(t *testing.T) {
+	const window = 64 << 10
+	pool := bb_zstd.NewBoundedPool(1, 1, []zstd.EOption{zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(window)}, []zstd.DOption{zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(window)})
+	data := bytes.Repeat([]byte("x"), 1<<20)
+	encoded, d := encode(t, data, 1<<20, pool)
+	index, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
+	require.NoError(t, err)
+	frame, err := index.ReadCompressedFrame(t.Context(), 0)
+	require.NoError(t, err)
+	var header zstd.Header
+	require.NoError(t, header.Decode(frame))
+	require.LessOrEqual(t, header.WindowSize, uint64(window))
+	var decoded bytes.Buffer
+	require.NoError(t, index.WriteIdentity(t.Context(), &decoded, 0, pool))
+	require.Equal(t, data, decoded.Bytes())
 }

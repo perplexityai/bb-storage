@@ -504,8 +504,8 @@ func TestCASBlobAccessGetWithCompression(t *testing.T) {
 	})
 }
 
-func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
-	// Create a pool with only 1 concurrent encoder to test backpressure.
+func TestCASBlobAccessSlowDestinationReleasesEncoder(t *testing.T) {
+	// A slow transport must not occupy the only encoder.
 	pool := bb_zstd.NewBoundedPool(1, 1, nil, nil)
 
 	ctrl, ctx := gomock.WithContext(context.Background(), t)
@@ -522,7 +522,7 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 	blobDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "1411ffd5854fa029dc4d231aa89311eb", 1000)
 	testUUID := uuid.Must(uuid.Parse("7d659e5f-0e4b-48f0-ad9f-3489db6e103b"))
 
-	// Hold the only encoder slot by starting a Put that blocks on SendMsg.
+	// Start an upload whose destination stops reading.
 	sendBlocked := make(chan struct{})
 	sendUnblock := make(chan struct{})
 
@@ -537,7 +537,7 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 	})
 	r1.EXPECT().Close()
 
-	// First SendMsg blocks, holding the encoder slot.
+	// First SendMsg blocks after the encoded frame has released its codec.
 	clientStream1.EXPECT().SendMsg(gomock.Any()).DoAndReturn(func(msg interface{}) error {
 		close(sendBlocked)
 		<-sendUnblock
@@ -555,11 +555,11 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 		require.NoError(t, err)
 	}()
 
-	// Wait for the first Put to acquire the encoder and block on SendMsg.
+	// Wait for the first upload to block at its destination.
 	<-sendBlocked
 
-	// Second Put should fail because the pool is exhausted and the context expires.
-	shortCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	// Another upload must still be able to acquire the encoder and complete.
+	shortCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	r2 := mock.NewMockFileReader(ctrl)
@@ -569,18 +569,16 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 	})
 	r2.EXPECT().Close()
 
-	// This Put needs a new stream — but it will fail before using it because
-	// AcquireEncoder blocks and the context times out.
 	clientStream2 := mock.NewMockClientStream(ctrl)
 	uuidGenerator.EXPECT().Call().Return(testUUID, nil)
 	client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Write").
 		Return(clientStream2, nil)
-	clientStream2.EXPECT().CloseSend().Return(nil).AnyTimes()
-	clientStream2.EXPECT().RecvMsg(gomock.Any()).Return(nil).AnyTimes()
+	clientStream2.EXPECT().SendMsg(gomock.Any()).Return(nil).Times(2)
+	clientStream2.EXPECT().CloseSend().Return(nil)
+	clientStream2.EXPECT().RecvMsg(gomock.Any()).Return(nil)
 
 	err := blobAccess.Put(shortCtx, blobDigest, buffer.NewValidatedBufferFromReaderAt(r2, 1000))
-	require.Error(t, err)
-	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.NoError(t, err)
 
 	// Unblock the first Put so it can complete.
 	close(sendUnblock)
