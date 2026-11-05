@@ -178,13 +178,20 @@ func (r *terminalErrorReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
+// EncodingError identifies a local codec failure, independent of upload input.
+// Storage must not retry the source when its own encoder is unavailable.
+type EncodingError struct{ Err error }
+
+func (e *EncodingError) Error() string { return e.Err.Error() }
+func (e *EncodingError) Unwrap() error { return e.Err }
+
 func compressFrame(ctx context.Context, data []byte, frameSize int, pool zstd.Pool) ([]byte, error) {
 	encoded, err := zstd.EncodeFrame(ctx, pool, data)
 	if err != nil {
-		return nil, err
+		return nil, &EncodingError{Err: err}
 	}
 	if int64(len(encoded)) > encodedLimit(frameSize) {
-		return nil, status.Error(codes.ResourceExhausted, "Compressed frame exceeds its size budget")
+		return nil, &EncodingError{Err: status.Error(codes.ResourceExhausted, "Compressed frame exceeds its size budget")}
 	}
 	return encoded, nil
 }
@@ -452,7 +459,18 @@ func (r *Reader) ReadFrameAt(ctx context.Context, offset int64, compressed bool,
 			return nil, err
 		}
 		defer decoder.Close()
-		return io.ReadAll(io.LimitReader(decoder, f.Size+1))
+		// Keep the actual terminal error: ReadFull alone turns a clean short
+		// stream and a truncated compressed stream into the same error.
+		source := terminalErrorReader{source: decoder}
+		data := make([]byte, f.Size+1)
+		n, err := io.ReadFull(&source, data)
+		if source.err != nil && source.err != io.EOF {
+			return nil, source.err
+		}
+		if source.err == io.EOF {
+			err = nil
+		}
+		return data[:n], err
 	}()
 	if readErr != nil {
 		return nil, offset, readErr

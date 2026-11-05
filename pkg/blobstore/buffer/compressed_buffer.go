@@ -55,7 +55,9 @@ func (b *casErrorHandlingBuffer) zstdChunkReaderAt(offset int64, limit int) (Chu
 
 type annotatingCompressedReader struct {
 	ChunkReader
-	handler ErrorHandler
+	handler   ErrorHandler
+	closeOnce sync.Once
+	closeErr  error
 }
 
 func (r *annotatingCompressedReader) Read() ([]byte, error) {
@@ -73,9 +75,11 @@ func (r *annotatingCompressedReader) Read() ([]byte, error) {
 func (r *annotatingCompressedReader) Close() { r.CloseWithError() }
 
 func (r *annotatingCompressedReader) CloseWithError() error {
-	err := closeChunkReader(r.ChunkReader)
-	r.handler.Done()
-	return err
+	r.closeOnce.Do(func() {
+		r.closeErr = closeChunkReader(r.ChunkReader)
+		r.handler.Done()
+	})
+	return r.closeErr
 }
 
 func (b *casBufferWithBackgroundTask) zstdChunkReaderAt(offset int64, limit int) (ChunkReader, bool) {
@@ -179,10 +183,6 @@ func (e *UploadDestinationError) Error() string { return e.Err.Error() }
 func (e *UploadDestinationError) Unwrap() error { return e.Err }
 
 func consumeCASUpload(ctx context.Context, b Buffer, pool zstd.Pool, consume func(Buffer) error) error {
-	if err := ctx.Err(); err != nil {
-		b.Discard()
-		return status.FromContextError(err).Err()
-	}
 	switch b := b.(type) {
 	case *casErrorHandlingBuffer:
 		defer b.errorHandler.Done()
@@ -190,7 +190,19 @@ func consumeCASUpload(ctx context.Context, b Buffer, pool zstd.Pool, consume fun
 		for {
 			err := consumeCASUpload(ctx, base, pool, consume)
 			var destination *UploadDestinationError
-			if err == nil || err == io.EOF || ctx.Err() != nil || errors.As(err, &destination) {
+			if err == nil || err == io.EOF || errors.As(err, &destination) {
+				return err
+			}
+			if ctx.Err() != nil {
+				if _, ok := b.errorHandler.(NonRetryingErrorHandler); ok {
+					replacement, translated := b.errorHandler.OnError(err)
+					if replacement != nil {
+						replacement.Discard()
+					}
+					if translated != nil {
+						return translated
+					}
+				}
 				return err
 			}
 			base, err = b.errorHandler.OnError(err)
@@ -206,22 +218,45 @@ func consumeCASUpload(ctx context.Context, b Buffer, pool zstd.Pool, consume fun
 		}
 		return b.task.err
 	case *deferredCASBuffer:
+		if err := ctx.Err(); err != nil {
+			b.Discard()
+			return status.FromContextError(err).Err()
+		}
 		return consumeCASUpload(ctx, b.resolve(), pool, consume)
 	case *compressedBuffer:
+		if err := ctx.Err(); err != nil {
+			b.Discard()
+			return status.FromContextError(err).Err()
+		}
 		r, err := b.encodedReader()
 		if err != nil {
 			return err
 		}
 		copy := *b
 		copy.ctx = ctx
-		copy.pool = pool
+		copy.pool = uploadCodecPool{Pool: pool}
 		copy.encoded = zstd.LimitUpload(r, b.digest.GetSizeBytes())
 		copy.stored = nil
 		copy.readEncoded = nil
 		return consume(&copy)
 	default:
+		if err := ctx.Err(); err != nil {
+			b.Discard()
+			return status.FromContextError(err).Err()
+		}
 		return consume(b)
 	}
+}
+
+type uploadCodecPool struct{ zstd.Pool }
+
+func (p uploadCodecPool) NewDecoder(ctx context.Context, r io.Reader) (zstd.Decoder, error) {
+	decoder, err := p.Pool.NewDecoder(ctx, r)
+	var acquisition *zstd.AcquisitionError
+	if errors.As(err, &acquisition) {
+		return nil, &UploadDestinationError{Err: acquisition.Err}
+	}
+	return decoder, err
 }
 
 // NewCASBufferFromZSTDRepresentation takes ownership of an already opened,
@@ -323,6 +358,10 @@ func (b *compressedBuffer) ToByteSlice(limit int) ([]byte, error) {
 }
 
 func (b *compressedBuffer) ToChunkReader(off int64, limit int) ChunkReader {
+	if err := validateReaderOffset(b.digest.GetSizeBytes(), off); err != nil {
+		b.Discard()
+		return newErrorChunkReader(err)
+	}
 	if b.stored != nil && off > 0 {
 		return newReaderBackedChunkReader(newChunkReaderBackedReader(&storedSuffixReader{buffer: b, offset: off}), limit)
 	}

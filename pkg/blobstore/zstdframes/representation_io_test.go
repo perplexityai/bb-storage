@@ -10,6 +10,7 @@ import (
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
+	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 
@@ -146,4 +147,78 @@ func TestEncodeCancellationDuringCommit(t *testing.T) {
 		return len(p), errDisk
 	}), d, bytes.NewReader(data), 4096, newPool())
 	require.ErrorIs(t, err, errDisk)
+}
+
+func TestShortInputHasNonRetryableStatus(t *testing.T) {
+	data := bytes.Repeat([]byte("x"), 4097)
+	d := blobDigest(data, remoteexecution.DigestFunction_SHA256)
+	for _, size := range []int{0, 17, 4096} {
+		var out bytes.Buffer
+		err := zstdframes.Encode(t.Context(), &out, d, bytes.NewReader(data[:size]), 4096, newPool())
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
+}
+
+type injectedDecoder struct{ io.Reader }
+
+func (injectedDecoder) Close() {}
+
+type decoderResultPool struct {
+	bb_zstd.Pool
+	reader io.Reader
+}
+
+func (p decoderResultPool) NewDecoder(context.Context, io.Reader) (bb_zstd.Decoder, error) {
+	return injectedDecoder{p.reader}, nil
+}
+
+func TestFrameDecodeLengthAndTerminalErrors(t *testing.T) {
+	data := bytes.Repeat([]byte("d"), 4096)
+	record, d := encode(t, data, 4096, newPool())
+	index, err := zstdframes.Open(bytes.NewReader(record), int64(len(record)), d)
+	require.NoError(t, err)
+	for _, tc := range []struct {
+		name                    string
+		data                    []byte
+		terminal, errorExpected error
+	}{
+		{"exact", data, io.EOF, nil},
+		{"short", data[:4095], io.EOF, zstdframes.ErrCorruptFrame},
+		{"long", append(bytes.Clone(data), 'd'), io.EOF, zstdframes.ErrCorruptFrame},
+		{"truncated-compressed", data, io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+		{"full-buffer-terminal", append(bytes.Clone(data), 'd'), io.ErrUnexpectedEOF, io.ErrUnexpectedEOF},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := decoderResultPool{Pool: newPool(), reader: &payloadErrorReader{data: tc.data, err: tc.terminal}}
+			got, _, err := index.ReadFrameAt(t.Context(), 0, false, p)
+			require.ErrorIs(t, err, tc.errorExpected)
+			if err == nil {
+				require.Equal(t, data, got)
+			}
+		})
+	}
+}
+
+func BenchmarkReadOneFrame(b *testing.B) {
+	data := bytes.Repeat([]byte("d"), 1<<20)
+	d := blobDigest(data, remoteexecution.DigestFunction_SHA256)
+	p := newPool()
+	var out bytes.Buffer
+	if err := zstdframes.Encode(b.Context(), &out, d, bytes.NewReader(data), 1<<20, p); err != nil {
+		b.Fatal(err)
+	}
+	index, err := zstdframes.Open(bytes.NewReader(out.Bytes()), int64(out.Len()), d)
+	if err != nil {
+		b.Fatal(err)
+	}
+	if _, _, err := index.ReadFrameAt(b.Context(), 0, false, p); err != nil {
+		b.Fatal(err)
+	}
+	b.ReportAllocs()
+	b.ResetTimer()
+	for b.Loop() {
+		if _, _, err := index.ReadFrameAt(b.Context(), 0, false, p); err != nil {
+			b.Fatal(err)
+		}
+	}
 }

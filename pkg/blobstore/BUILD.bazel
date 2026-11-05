@@ -101,3 +101,14 @@ go_test(
         "@org_uber_go_mock//gomock",
     ],
 )
+
+go_test(
+    name = "compressed_admission_test",
+    srcs = ["compressed_admission_test.go"],
+    embed = [":blobstore"],
+    deps = [
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+    ],
+)

@@ -1,6 +1,8 @@
 package zstd
 
 import (
+	"time"
+
 	"github.com/buildbarn/bb-storage/pkg/clock"
 	configuration "github.com/buildbarn/bb-storage/pkg/proto/configuration/zstd"
 	"github.com/klauspost/compress/zstd"
@@ -48,5 +50,7 @@ func NewUploadPoolFromConfiguration(config *configuration.PoolConfiguration, max
 		return nil, status.Errorf(codes.InvalidArgument, "Invalid upload decoder options: %v", err)
 	}
 	decoder.Close()
-	return NewMetricsPool(NewBoundedPool(encoders, decoders, encoderOptions, decoderOptions), clock.SystemClock, "ZstdUploadPool"), nil
+	pool := NewBoundedPool(encoders, decoders, encoderOptions, decoderOptions).(*boundedPool)
+	pool.acquisitionTimeout = 30 * time.Second
+	return NewMetricsPool(pool, clock.SystemClock, "ZstdUploadPool"), nil
 }

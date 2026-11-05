@@ -96,12 +96,12 @@ func (b *casErrorHandlingBuffer) ToByteSlice(maximumSizeBytes int) (data []byte,
 }
 
 func (b *casErrorHandlingBuffer) ToChunkReader(off int64, maximumChunkSizeBytes int) ChunkReader {
-	if _, ok := b.errorHandler.(NonRetryingErrorHandler); ok {
-		return &annotatingCompressedReader{ChunkReader: b.base.ToChunkReader(off, maximumChunkSizeBytes), handler: b.errorHandler}
-	}
 	if err := validateReaderOffset(b.digest.GetSizeBytes(), off); err != nil {
 		b.Discard()
 		return newErrorChunkReader(err)
+	}
+	if _, ok := b.errorHandler.(NonRetryingErrorHandler); ok && supportsIndexedReads(b.base) {
+		return &annotatingCompressedReader{ChunkReader: b.base.ToChunkReader(off, maximumChunkSizeBytes), handler: b.errorHandler}
 	}
 	return newOffsetChunkReader(b.toValidatedChunkReader(maximumChunkSizeBytes), off)
 }
@@ -140,4 +140,21 @@ func (b *casErrorHandlingBuffer) toUnvalidatedChunkReader(off int64, maximumChun
 
 func (b *casErrorHandlingBuffer) toUnvalidatedReader(off int64) io.ReadCloser {
 	return newErrorHandlingReader(b.base, b.errorHandler, off)
+}
+
+// Only local indexed records may skip validation of preceding logical bytes.
+func supportsIndexedReads(b Buffer) bool {
+	switch b := b.(type) {
+	case *compressedBuffer:
+		return b.stored != nil
+	case *deferredCASBuffer:
+		return supportsIndexedReads(b.resolve())
+	case *casBufferWithBackgroundTask:
+		return supportsIndexedReads(b.base)
+	case *casErrorHandlingBuffer:
+		_, ok := b.errorHandler.(NonRetryingErrorHandler)
+		return ok && supportsIndexedReads(b.base)
+	default:
+		return false
+	}
 }

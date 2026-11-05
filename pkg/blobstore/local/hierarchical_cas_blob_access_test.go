@@ -118,6 +118,19 @@ func TestHierarchicalCASBlobAccessGet(t *testing.T) {
 		require.Equal(t, []byte("Hello"), data)
 	})
 
+	t.Run("RefreshAllocationFailureReleasesReader", func(t *testing.T) {
+		keyLocationMap.EXPECT().Get(lookupKey1, blockReferenceResolver).Return(location1, nil).Times(2)
+		getter := mock.NewMockLocationBlobGetter(ctrl)
+		locationBlobMap.EXPECT().Get(location1).Return(getter.Call, true).Times(2)
+		keyLocationMap.EXPECT().Get(canonicalKey, blockReferenceResolver).Return(local.Location{}, status.Error(codes.NotFound, "missing"))
+		reader := mock.NewMockReadCloser(ctrl)
+		getter.EXPECT().Call(helloDigest).Return(buffer.NewCASBufferFromReader(helloDigest, reader, buffer.UserProvided))
+		locationBlobMap.EXPECT().Put(int64(5)).Return(nil, status.Error(codes.ResourceExhausted, "no space"))
+		reader.EXPECT().Close()
+		_, err := blobAccess.Get(ctx, helloDigest).ToByteSlice(10)
+		require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	})
+
 	t.Run("RefreshSuccess", func(t *testing.T) {
 		// Because there is no canonical entry in the
 		// key-location map that doesn't need to be refreshed,

@@ -52,17 +52,23 @@ all staging capacity is held by its callers. Blobs that can never fit return
 `maximumConcurrentWrites` is the upload codec concurrency budget. Uploads have
 separate encoder and decoder pools, independent of read-side codecs. The default
 counts equal that budget, with fastest encoding, a 1 MiB encoder window, and an
-8 MiB decoder window. Optional `uploadZstdPool` overrides these settings using the
-Zstd pool configuration schema; codec counts cannot exceed the budget. Both pools
+8 MiB decoder window. Encoded uploads requiring larger windows (for example,
+some `zstd --long` streams) are deliberately rejected with `INVALID_ARGUMENT`.
+Increase the upload decoder window explicitly if such clients must be supported,
+and account for the additional memory per concurrent decoder. Optional
+`uploadZstdPool` overrides these settings using the Zstd pool configuration schema; codec counts cannot exceed the budget. Both pools
 contribute to total process memory. Startup checks that read decoders can decode
 the upload pool's stored frames before opening the device.
 
 Slow compressed clients hold upload decoders while receiving. They cannot consume
 read-side codec capacity. At most four times the budget may be receiving or waiting,
 including duplicates; a full request queue returns `RESOURCE_EXHAUSTED`. Requests
-wait up to 30 seconds for staging bytes, or their own deadline if earlier. Codec
-waits use the request deadline. Identity streams do not acquire an upload decoder;
-they acquire an encoder only after a logical frame is available. Encoder leases
+wait up to 30 seconds for staging bytes, or their own deadline if earlier.
+Admission permits smaller uploads to pass a larger waiter when they fit; a large
+upload can time out under sustained smaller traffic. Upload codec acquisition has
+its own 30-second cap, shortened by the caller deadline. That cap does not limit
+an already-acquired codec or interrupt network reads. Identity streams do not
+acquire an upload decoder; they acquire an encoder only after a logical frame is available. Encoder leases
 release before receiving further input or sending output. There is no extra write
 semaphore spanning source reads, which would deadlock synchronized replication
 clones sharing the same destination.
@@ -91,6 +97,10 @@ logical bytes retain the validating decode/encode fallback.
 ## Read behavior and fresh-store requirement
 
 - Start with an empty store. Unindexed raw records larger than 4 KiB are rejected.
+  Persistent stores write a durable `storage-format` marker under
+  `persistent.stateDirectoryPath`. Startup refuses a different mode or version
+  before opening the block device. Unmarked `state` or `state.new` files count
+  as legacy raw state and cannot be opened with compression enabled.
   Tiny raw records produced by this mode receive bounded logical validation.
 - Full compressed reads verify each stored frame's encoded checksum before
   exposing its bytes. Trusted backend streams retain their encoded representation
@@ -119,6 +129,21 @@ mode. Retire the cache data before changing back to raw-only storage or an
 incompatible format. A recognized unsupported footer version returns
 `FAILED_PRECONDITION` without invalidation. Changing shard configuration or
 deploying this code is a separate operator action.
+
+To start fresh, stop every process using the store, retain the old cache only as
+an offline backup if needed, and configure a new empty `persistent.stateDirectoryPath`
+and fresh key-location-map backing files. Provision fresh block backing storage
+as well when retiring the old cache. A state directory must contain none of
+`state`, `state.new`, or `storage-format`; do not remove only the format marker
+from an existing store. For nonpersistent configurations, startup initializes a
+new store. Older binaries do not understand the marker, so the guard is not a
+safe rollback mechanism for them.
+
+Unsupported-version records are not evidence of block corruption. A duplicate
+upload checks the stored index; an unreadable record permits a validated repair
+that replaces its mapping without evicting neighboring blocks, including with
+hierarchical instance names. Presence checks alone may still report such a
+record as present until a read or an explicit repair.
 
 ## Format integrity and bounds
 

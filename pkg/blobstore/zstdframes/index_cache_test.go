@@ -143,3 +143,40 @@ func TestIndexCacheDoesNotRetainInstanceIdentity(t *testing.T) {
 		require.Equal(t, instance, r.FrameDigests()[0].GetInstanceName().String(), "returned readers retain the current caller identity")
 	}
 }
+
+func TestIndexCacheFooterSeparatesSameSizeRecords(t *testing.T) {
+	data := bytes.Repeat([]byte("f"), 4096)
+	record, d := encode(t, data, 4096, newPool())
+	cache := zstdframes.NewIndexCache(1 << 20)
+	_, err := cache.Open(bytes.NewReader(record), int64(len(record)), d)
+	require.NoError(t, err)
+	other := rewriteIndex(t, record, func(m map[string]any) {
+		m["frames"].([]any)[0].(map[string]any)["hash"] = strings.Repeat("0", 64)
+	})
+	require.Len(t, other, len(record), "cache keys must collide if footer is omitted")
+	source := &indexReadCounter{Reader: bytes.NewReader(other)}
+	index, err := cache.Open(source, int64(len(other)), d)
+	require.NoError(t, err)
+	require.Equal(t, 2, source.reads, "changed footer must force index parsing")
+	_, _, err = index.ReadFrameAt(t.Context(), 0, false, newPool())
+	require.ErrorIs(t, err, zstdframes.ErrCorruptFrame)
+}
+
+func TestIndexCacheAccessUpdatesRecency(t *testing.T) {
+	a, da := encode(t, bytes.Repeat([]byte("a"), 5000), 4096, newPool())
+	b, db := encode(t, bytes.Repeat([]byte("b"), 5000), 4096, newPool())
+	c, dc := encode(t, bytes.Repeat([]byte("c"), 5000), 4096, newPool())
+	cache := zstdframes.NewIndexCache(5000)
+	open := func(data []byte, d digest.Digest) int {
+		r := &indexReadCounter{Reader: bytes.NewReader(data)}
+		_, err := cache.Open(r, int64(len(data)), d)
+		require.NoError(t, err)
+		return r.reads
+	}
+	require.Equal(t, 2, open(a, da))
+	require.Equal(t, 2, open(b, db))
+	require.Equal(t, 1, open(a, da)) // Touch A, making B oldest.
+	require.Equal(t, 2, open(c, dc))
+	require.Equal(t, 1, open(a, da), "recently accessed A must survive")
+	require.Equal(t, 2, open(b, db), "B must have been evicted")
+}

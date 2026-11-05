@@ -71,3 +71,50 @@ func TestCopyPreservesFullFrameSourceError(t *testing.T) {
 	require.ErrorIs(t, bb_zstd.Copy(t.Context(), nil, &out, finalErrorReader{failure}), failure)
 	require.Empty(t, out.Bytes())
 }
+
+type encoderAcquiringWriter struct {
+	ctx    context.Context
+	pool   bb_zstd.Pool
+	output bytes.Buffer
+}
+
+func (w *encoderAcquiringWriter) Write(p []byte) (int, error) {
+	e, err := w.pool.NewEncoder(w.ctx, io.Discard)
+	if err != nil {
+		return 0, err
+	}
+	if err := e.Close(); err != nil {
+		return 0, err
+	}
+	return w.output.Write(p)
+}
+
+type readBufferObserver struct {
+	*bytes.Reader
+	maximum int
+}
+
+func (r *readBufferObserver) Read(p []byte) (int, error) {
+	r.maximum = max(r.maximum, len(p))
+	return r.Reader.Read(p)
+}
+
+func TestCopyReleasesEncoderBeforeDestinationWriteAndBoundsInputBuffer(t *testing.T) {
+	for _, size := range []int{0, 10, 1 << 20, 1<<20 + 1} {
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		p := bb_zstd.NewBoundedPool(1, 1, []zstd.EOption{zstd.WithEncoderConcurrency(1)}, []zstd.DOption{zstd.WithDecoderConcurrency(1)})
+		data := bytes.Repeat([]byte("b"), size)
+		src := &readBufferObserver{Reader: bytes.NewReader(data)}
+		dst := &encoderAcquiringWriter{ctx: ctx, pool: p}
+		err := bb_zstd.CopySized(ctx, p, dst, src, int64(size))
+		cancel()
+		require.NoError(t, err)
+		require.Equal(t, min(1<<20, max(1, size)), src.maximum)
+		decoder, err := zstd.NewReader(nil)
+		require.NoError(t, err)
+		got, err := decoder.DecodeAll(dst.output.Bytes(), nil)
+		decoder.Close()
+		require.NoError(t, err)
+		require.Equal(t, data, got)
+	}
+}

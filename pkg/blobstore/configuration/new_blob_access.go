@@ -175,6 +175,11 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			digestKeyFormat = creator.GetBaseDigestKeyFormat()
 		}
 		persistent := backend.Local.Persistent
+		if persistent != nil {
+			if err := local.CheckPersistentStorageFormat(persistent.StateDirectoryPath, compression != nil); err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+		}
 
 		// Create the backing store for blocks of data.
 		var backendType string

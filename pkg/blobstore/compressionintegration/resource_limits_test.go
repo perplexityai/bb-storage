@@ -455,3 +455,23 @@ func TestIncompatibleUploadWindowsFailBeforeOpeningStorage(t *testing.T) {
 		})
 	}
 }
+
+func TestTinyRecordSizeCollision(t *testing.T) {
+	p := pool()
+	store, _, _ := localStorage(t, p)
+	for _, size := range []int{389, 390, 391} {
+		data := make([]byte, size)
+		d := digestOf(data)
+		var record bytes.Buffer
+		uploadPool, err := bb_zstd.NewUploadPoolFromConfiguration(nil, 1)
+		require.NoError(t, err)
+		require.NoError(t, zstdframes.Encode(t.Context(), &record, d, bytes.NewReader(data), 1<<20, uploadPool))
+		if size == 390 {
+			require.Equal(t, size, record.Len(), "fixture must exercise equal physical and logical lengths")
+		}
+		require.NoError(t, store.Put(t.Context(), d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided)), "size %d", size)
+		actual, err := store.Get(t.Context(), d).ToByteSlice(size)
+		require.NoError(t, err)
+		require.Equal(t, data, actual)
+	}
+}

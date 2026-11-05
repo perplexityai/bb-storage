@@ -6,6 +6,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"sync"
 	"syscall"
 	"time"
 
@@ -25,7 +26,7 @@ type compressedCASBlobAccess struct {
 	BlobAccess
 	directory          string
 	maximumStagedBytes int64
-	bytes              *semaphore.Weighted
+	bytes              *stagingBudget
 	requests           *semaphore.Weighted
 	pool               zstd.Pool
 }
@@ -39,7 +40,7 @@ func NewCompressedCASBlobAccess(base BlobAccess, directory string, maximumStaged
 	if err := ValidateCompressedCASConfiguration(directory, maximumStagedBytes, maximumWrites, pool); err != nil {
 		return nil, err
 	}
-	return &compressedCASBlobAccess{BlobAccess: base, directory: directory, maximumStagedBytes: maximumStagedBytes, bytes: semaphore.NewWeighted(maximumStagedBytes), requests: semaphore.NewWeighted(4 * maximumWrites), pool: pool}, nil
+	return &compressedCASBlobAccess{BlobAccess: base, directory: directory, maximumStagedBytes: maximumStagedBytes, bytes: &stagingBudget{available: maximumStagedBytes, changed: make(chan struct{})}, requests: semaphore.NewWeighted(4 * maximumWrites), pool: pool}, nil
 }
 
 // ValidateCompressedCASConfiguration checks staging requirements before a
@@ -82,12 +83,38 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	// This runs inside Put, after any upload authorization. Checking in the
 	// protocol handler via FindMissing would instead apply read-side policy.
 	missing, err := ba.BlobAccess.FindMissing(ctx, d.ToSingletonSet())
-	if err != nil && status.Code(err) != codes.Unavailable && status.Code(err) != codes.Internal && status.Code(err) != codes.DataLoss && status.Code(err) != codes.Unknown {
+	if err != nil && status.Code(err) != codes.Unavailable && status.Code(err) != codes.Internal && status.Code(err) != codes.DataLoss && status.Code(err) != codes.Unknown && status.Code(err) != codes.FailedPrecondition {
 		b.Discard()
 		return err
 	}
+	repair := err != nil
 	if err == nil && missing.Empty() {
-		return buffer.SkipUpload(b)
+		// Opening the logical end validates the index without decoding the
+		// payload. Presence alone cannot identify unsupported or unreadable
+		// records, and must not suppress an authorized repair upload.
+		r := buffer.NewReaderFromChunkReader(ba.Get(ctx, d).ToChunkReader(d.GetSizeBytes(), 1))
+		var probe [1]byte
+		_, readErr := r.Read(probe[:])
+		if closeErr := r.Close(); closeErr != nil && (readErr == nil || readErr == io.EOF) {
+			readErr = closeErr
+		}
+		if readErr == nil || readErr == io.EOF {
+			return buffer.SkipUpload(b)
+		}
+		switch status.Code(readErr) {
+		case codes.Canceled, codes.DeadlineExceeded, codes.PermissionDenied, codes.Unauthenticated:
+			b.Discard()
+			return readErr
+		}
+		repair = true
+	}
+	put := ba.BlobAccess.Put
+	if repair {
+		if local, ok := ba.BlobAccess.(interface {
+			PutRepair(context.Context, digest.Digest, buffer.Buffer) error
+		}); ok {
+			put = local.PutRepair
+		}
 	}
 
 	reservation, err := zstdframes.MaximumStoredSize(d.GetSizeBytes(), storedFrameSize)
@@ -127,6 +154,10 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 		}
 		w := &stagingWriter{file: f, remaining: reservation}
 		if err := zstdframes.Encode(ctx, w, d, r, storedFrameSize, ba.pool); err != nil {
+			var encoding *zstdframes.EncodingError
+			if errors.As(err, &encoding) {
+				return &buffer.UploadDestinationError{Err: encoding.Err}
+			}
 			return err
 		}
 		if err := ctx.Err(); err != nil {
@@ -144,13 +175,56 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 		// Tiny records do not justify an index. Larger incompressible records
 		// retain frame checksums so indexed random reads remain efficient.
 		// Decode staging directly into the raw allocation without another file.
-		logical := NewCompressedCASReadBufferFactory(ba.pool).NewBufferFromReaderAt(d, &stagingReader{ctx: ctx, File: f}, physicalSize, func(bool) {})
-		return ba.BlobAccess.Put(ctx, d, buffer.WithZSTDContext(logical, ctx))
+		reader := &stagingReader{ctx: ctx, File: f}
+		index, err := zstdframes.Open(reader, physicalSize, d)
+		if err != nil {
+			return err
+		}
+		logical := buffer.NewCASBufferFromZSTDRepresentation(d, reader, physicalSize, index, ba.pool, buffer.BackendProvided(func(bool) {}))
+		return put(ctx, d, buffer.WithZSTDContext(logical, ctx))
 	}
-	return ba.BlobAccess.Put(ctx, d, buffer.NewValidatedBufferFromReaderAt(&stagingReader{ctx: ctx, File: f}, physicalSize))
+	return put(ctx, d, buffer.NewValidatedBufferFromReaderAt(&stagingReader{ctx: ctx, File: f}, physicalSize))
 }
 
-func acquireUploadCapacity(ctx context.Context, capacity *semaphore.Weighted, amount int64) error {
+// A fitting upload may pass a larger waiter. The request semaphore bounds the
+// number of waiters; the acquisition deadline bounds starvation of large blobs.
+type stagingBudget struct {
+	mu        sync.Mutex
+	available int64
+	changed   chan struct{}
+}
+
+func (b *stagingBudget) Acquire(ctx context.Context, amount int64) error {
+	for {
+		b.mu.Lock()
+		if err := ctx.Err(); err != nil {
+			b.mu.Unlock()
+			return err
+		}
+		if amount <= b.available {
+			b.available -= amount
+			b.mu.Unlock()
+			return nil
+		}
+		changed := b.changed
+		b.mu.Unlock()
+		select {
+		case <-changed:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func (b *stagingBudget) Release(amount int64) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.available += amount
+	close(b.changed)
+	b.changed = make(chan struct{})
+}
+
+func acquireUploadCapacity(ctx context.Context, capacity *stagingBudget, amount int64) error {
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := capacity.Acquire(waitCtx, amount); err != nil {
