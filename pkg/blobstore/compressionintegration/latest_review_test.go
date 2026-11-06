@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
@@ -48,6 +49,9 @@ func TestUnsupportedRecordCanBeRepairedWithoutEvictingNeighbors(t *testing.T) {
 			require.NoError(t, f.Close())
 			_, err = store.Get(t.Context(), d).ToByteSlice(len(data))
 			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			missing, err := store.FindMissing(t.Context(), d.ToSingletonSet())
+			require.NoError(t, err)
+			require.Equal(t, d.ToSingletonSet(), missing)
 			parent := d
 			if hierarchical {
 				d = digest.MustNewDigest("parent/child", d.GetDigestFunction().GetEnumValue(), d.GetHashString(), d.GetSizeBytes())
@@ -157,9 +161,7 @@ func TestEncoderFailureDoesNotRetryTheSource(t *testing.T) {
 	data := bytes.Repeat([]byte("healthy source"), 1000)
 	d := digestOf(data)
 	failure := status.Error(codes.Unavailable, "local codec unavailable")
-	base := &repairRecordStore{lookupError: status.Error(codes.NotFound, "missing")}
-	// An unavailable lookup allows a repair attempt against this external store fixture.
-	base.lookupError = status.Error(codes.Unavailable, "lookup unavailable")
+	base := &repairRecordStore{lookupError: status.Error(codes.Unavailable, "lookup unavailable")}
 	store, err := blobstore.NewCompressedCASBlobAccess(base, t.TempDir(), 1<<20, 1, failingEncoderPool{Pool: pool(), err: failure})
 	require.NoError(t, err)
 	h := &stagingRetryHandler{}
@@ -284,4 +286,184 @@ func TestInheritedUnsupportedRecordRepair(t *testing.T) {
 	got, err := store.Get(t.Context(), child).ToByteSlice(len(data))
 	require.NoError(t, err)
 	require.Equal(t, data, got)
+}
+
+func TestFailedStartupDoesNotPublishPersistentFormat(t *testing.T) {
+	for _, invalidDevice := range []bool{false, true} {
+		dir := t.TempDir()
+		device := filepath.Join(dir, "blocks")
+		if invalidDevice {
+			device = filepath.Join(dir, "missing", "blocks")
+		}
+		var config pb.BlobAccessConfiguration
+		require.NoError(t, protojson.Unmarshal([]byte(fmt.Sprintf(`{"local":{"persistent":{"stateDirectoryPath":%q,"minimumEpochInterval":"1s"},"blocksOnBlockDevice":{"source":{"file":{"path":%q,"sizeBytes":"81920"}},"spareBlocks":2},"oldBlocks":1,"currentBlocks":1,"newBlocks":1,"casCompression":{"stagingDirectory":%q,"maximumStagedBytes":"1048576","maximumConcurrentWrites":"1"}}}`, dir, device, dir)), &config))
+		// With a valid device, the deliberately absent key-map backend fails late,
+		// after the syncer is constructed. Neither path may start persistence.
+		_, err := configuration.NewBlobAccessFromConfiguration(nil, &config, configuration.NewCASBlobAccessCreator(nil, 4<<20, pool()))
+		require.Error(t, err)
+		for _, name := range []string{"storage-format", "storage-format.new", "state", "state.new"} {
+			_, err := os.Stat(filepath.Join(dir, name))
+			require.True(t, os.IsNotExist(err), name)
+		}
+	}
+}
+
+func TestEncoderWaitCancellationReachesUploadObserver(t *testing.T) {
+	p := pool()
+	held, err := p.NewEncoder(t.Context(), io.Discard)
+	require.NoError(t, err)
+	defer held.Close()
+	base := &repairRecordStore{lookupError: status.Error(codes.Unavailable, "lookup unavailable")}
+	store, err := blobstore.NewCompressedCASBlobAccess(base, t.TempDir(), 1<<20, 1, p)
+	require.NoError(t, err)
+	data := bytes.Repeat([]byte("encoder cancellation"), 1000)
+	d := digestOf(data)
+	h := &uploadObserver{}
+	b := buffer.WithErrorHandler(buffer.NewCASBufferFromReader(d, io.NopCloser(bytes.NewReader(data)), buffer.UserProvided), h)
+	ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+	defer cancel()
+	err = store.Put(ctx, d, b)
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err))
+	require.Len(t, h.errors, 1)
+	require.Equal(t, codes.DeadlineExceeded, status.Code(h.errors[0]))
+	require.Equal(t, 1, h.done)
+}
+
+type oversizedFramePool struct{ bb_zstd.Pool }
+
+func (oversizedFramePool) NewEncoder(context.Context, io.Writer) (bb_zstd.Encoder, error) {
+	return oversizedFrameEncoder{}, nil
+}
+
+type oversizedFrameEncoder struct{}
+
+func (oversizedFrameEncoder) EncodeAll([]byte, []byte) []byte { return make([]byte, 2<<20) }
+func (oversizedFrameEncoder) Write(p []byte) (int, error)     { return len(p), nil }
+func (oversizedFrameEncoder) Close() error                    { return nil }
+func TestLocalFrameBudgetDoesNotRetrySource(t *testing.T) {
+	base := &repairRecordStore{lookupError: status.Error(codes.Unavailable, "lookup unavailable")}
+	store, err := blobstore.NewCompressedCASBlobAccess(base, t.TempDir(), 1<<20, 1, oversizedFramePool{Pool: pool()})
+	require.NoError(t, err)
+	data := bytes.Repeat([]byte("good input"), 1000)
+	d := digestOf(data)
+	h := &stagingRetryHandler{}
+	b := buffer.WithErrorHandler(buffer.NewCASBufferFromReader(d, io.NopCloser(bytes.NewReader(data)), buffer.UserProvided), h)
+	err = store.Put(t.Context(), d, b)
+	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Zero(t, h.calls)
+	require.Equal(t, 1, h.done)
+	require.Zero(t, base.puts)
+}
+
+func TestNonIndexedReadersKeepValidationOutsideObservers(t *testing.T) {
+	data := []byte("expected input")
+	d := digestOf(data)
+	h := &uploadObserver{}
+	wrong := bytes.Clone(data)
+	wrong[0] ^= 1
+	b := buffer.WithErrorHandler(buffer.NewCASBufferFromReader(d, io.NopCloser(bytes.NewReader(wrong)), buffer.UserProvided), h)
+	r := buffer.NewReaderFromChunkReader(b.ToChunkReader(0, 4096))
+	_, err := io.ReadAll(r)
+	r.Close()
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Empty(t, h.errors)
+	require.Equal(t, 1, h.done)
+}
+
+func TestStoredBufferRejectsOffsetsBeforeIndexedRead(t *testing.T) {
+	data := bytes.Repeat([]byte("direct bounds"), 1000)
+	d := digestOf(data)
+	p := pool()
+	var record bytes.Buffer
+	require.NoError(t, zstdframes.Encode(t.Context(), &record, d, bytes.NewReader(data), 4096, p))
+	b := blobstore.NewCompressedCASReadBufferFactory(p).NewBufferFromByteSlice(d, record.Bytes(), func(bool) {})
+	r := b.ToChunkReader(int64(len(data))+1, 4096)
+	_, err := r.Read()
+	r.Close()
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+type probeFailureStore struct {
+	repairRecordStore
+	failure error
+}
+
+func (s *probeFailureStore) Get(context.Context, digest.Digest) buffer.Buffer {
+	return buffer.NewBufferFromError(s.failure)
+}
+
+func TestMetadataProbePreservesTemporaryFailures(t *testing.T) {
+	for _, code := range []codes.Code{codes.ResourceExhausted, codes.Unavailable, codes.PermissionDenied, codes.Canceled} {
+		base := &probeFailureStore{failure: status.Error(code, "temporary probe failure")}
+		store, err := blobstore.NewCompressedCASBlobAccess(base, t.TempDir(), 1<<20, 1, pool())
+		require.NoError(t, err)
+		data := []byte("input")
+		d := digestOf(data)
+		_, err = store.FindMissing(t.Context(), d.ToSingletonSet())
+		require.Equal(t, code, status.Code(err))
+		if code == codes.ResourceExhausted {
+			err = store.Put(t.Context(), d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided))
+			require.Equal(t, code, status.Code(err))
+			require.Zero(t, base.puts)
+		}
+	}
+}
+
+func TestMarkerPublicationFailureDoesNotStartPersistence(t *testing.T) {
+	dir := t.TempDir()
+	stale := filepath.Join(dir, "storage-format.new")
+	require.NoError(t, os.Mkdir(stale, 0o700))
+	require.NoError(t, os.WriteFile(filepath.Join(stale, "block-removal"), nil, 0o600))
+	var config pb.BlobAccessConfiguration
+	require.NoError(t, protojson.Unmarshal([]byte(fmt.Sprintf(`{"local":{"persistent":{"stateDirectoryPath":%q,"minimumEpochInterval":"1s"},"keyLocationMap":{"inMemory":{"entries":"1024"},"maximumGetAttempts":16,"maximumPutAttempts":"64"},"blocksOnBlockDevice":{"source":{"file":{"path":%q,"sizeBytes":"81920"}},"spareBlocks":2},"oldBlocks":1,"currentBlocks":1,"newBlocks":1,"casCompression":{"stagingDirectory":%q,"maximumStagedBytes":"1048576","maximumConcurrentWrites":"1"}}}`, dir, filepath.Join(dir, "blocks"), dir)), &config))
+	// No lifecycle group is supplied: starting the syncer before publication
+	// succeeds would panic as well as leak its independent release goroutine.
+	_, err := configuration.NewBlobAccessFromConfiguration(nil, &config, configuration.NewCASBlobAccessCreator(nil, 4<<20, pool()))
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Contains(t, err.Error(), "temporary storage format marker")
+	for _, name := range []string{"storage-format", "state", "state.new"} {
+		_, err := os.Stat(filepath.Join(dir, name))
+		require.True(t, os.IsNotExist(err), name)
+	}
+}
+
+func TestMissingStateDirectoryHasStartupContext(t *testing.T) {
+	var config pb.BlobAccessConfiguration
+	require.NoError(t, protojson.Unmarshal([]byte(fmt.Sprintf(`{"local":{"persistent":{"stateDirectoryPath":%q}}}`, filepath.Join(t.TempDir(), "missing"))), &config))
+	_, err := configuration.NewBlobAccessFromConfiguration(nil, &config, configuration.NewCASBlobAccessCreator(nil, 4<<20, pool()))
+	require.Equal(t, codes.Internal, status.Code(err))
+	require.Contains(t, err.Error(), "Failed to open persistent state directory")
+}
+
+type cancelingEncoderPool struct {
+	bb_zstd.Pool
+	cancel  context.CancelFunc
+	failure error
+}
+
+func (p cancelingEncoderPool) NewEncoder(context.Context, io.Writer) (bb_zstd.Encoder, error) {
+	return cancelingEncoder{cancel: p.cancel, failure: p.failure}, nil
+}
+
+type cancelingEncoder struct {
+	cancel  context.CancelFunc
+	failure error
+}
+
+func (cancelingEncoder) Write(p []byte) (int, error) { return len(p), nil }
+func (e cancelingEncoder) Close() error              { e.cancel(); return e.failure }
+func TestEncoderFailureSurvivesConcurrentCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	failure := status.Error(codes.Unavailable, "local encoder close failed")
+	base := &repairRecordStore{lookupError: status.Error(codes.Unavailable, "lookup unavailable")}
+	store, err := blobstore.NewCompressedCASBlobAccess(base, t.TempDir(), 1<<20, 1, cancelingEncoderPool{Pool: pool(), cancel: cancel, failure: failure})
+	require.NoError(t, err)
+	data := bytes.Repeat([]byte("encoder error precedence"), 1000)
+	d := digestOf(data)
+	h := &stagingRetryHandler{}
+	b := buffer.WithErrorHandler(buffer.NewCASBufferFromReader(d, io.NopCloser(bytes.NewReader(data)), buffer.UserProvided), h)
+	require.ErrorIs(t, store.Put(ctx, d, b), failure)
+	require.Zero(t, h.calls)
+	require.Equal(t, 1, h.done)
 }

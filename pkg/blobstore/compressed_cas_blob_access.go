@@ -70,6 +70,39 @@ func (ba *compressedCASBlobAccess) GetFromComposite(ctx context.Context, parent,
 	return b
 }
 
+// Presence requires readable metadata: otherwise clients that check before
+// uploading can never repair unsupported records. Get also refreshes old blocks.
+func (ba *compressedCASBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (digest.Set, error) {
+	missing := digest.NewSetBuilder(digests.Length())
+	for _, d := range digests.Items() {
+		if err := ctx.Err(); err != nil {
+			return digest.EmptySet, status.FromContextError(err).Err()
+		}
+		err := ba.probeRecord(ctx, d)
+		switch status.Code(err) {
+		case codes.OK:
+		case codes.NotFound, codes.FailedPrecondition, codes.DataLoss:
+			missing.Add(d)
+		default:
+			return digest.EmptySet, err
+		}
+	}
+	return missing.Build(), nil
+}
+
+func (ba *compressedCASBlobAccess) probeRecord(ctx context.Context, d digest.Digest) error {
+	r := buffer.NewReaderFromChunkReader(ba.Get(ctx, d).ToChunkReader(d.GetSizeBytes(), 1))
+	var probe [1]byte
+	_, err := r.Read(probe[:])
+	if closeErr := r.Close(); closeErr != nil && (err == nil || err == io.EOF) {
+		err = closeErr
+	}
+	if err == io.EOF {
+		return nil
+	}
+	return err
+}
+
 func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b buffer.Buffer) error {
 	if err := ctx.Err(); err != nil {
 		b.Discard()
@@ -92,17 +125,12 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 		// Opening the logical end validates the index without decoding the
 		// payload. Presence alone cannot identify unsupported or unreadable
 		// records, and must not suppress an authorized repair upload.
-		r := buffer.NewReaderFromChunkReader(ba.Get(ctx, d).ToChunkReader(d.GetSizeBytes(), 1))
-		var probe [1]byte
-		_, readErr := r.Read(probe[:])
-		if closeErr := r.Close(); closeErr != nil && (readErr == nil || readErr == io.EOF) {
-			readErr = closeErr
-		}
+		readErr := ba.probeRecord(ctx, d)
 		if readErr == nil || readErr == io.EOF {
 			return buffer.SkipUpload(b)
 		}
 		switch status.Code(readErr) {
-		case codes.Canceled, codes.DeadlineExceeded, codes.PermissionDenied, codes.Unauthenticated:
+		case codes.Canceled, codes.DeadlineExceeded, codes.PermissionDenied, codes.Unauthenticated, codes.ResourceExhausted:
 			b.Discard()
 			return readErr
 		}

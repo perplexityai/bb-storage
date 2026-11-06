@@ -71,7 +71,7 @@ func (p *boundedPool) acquire(ctx context.Context, sem *semaphore.Weighted) erro
 		if ctx.Err() != nil {
 			return contextError(ctx)
 		}
-		return &AcquisitionError{Err: status.Error(codes.ResourceExhausted, "Timed out waiting for upload codec capacity")}
+		return &AcquisitionError{Err: status.Error(codes.ResourceExhausted, "Timed out waiting for codec capacity")}
 	}
 	return nil
 }

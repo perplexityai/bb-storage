@@ -313,12 +313,16 @@ func (ba *hierarchicalCASBlobAccess) put(ctx context.Context, blobDigest digest.
 		// that existing grant, but never create a new parent grant if it
 		// disappeared while the replacement was being written.
 		inheritedKey, _, err := ba.getLeastSpecificLookupEntry(getAllLookupKeys(blobDigest))
-		if err == nil {
-			lookupKey = inheritedKey
-		} else if status.Code(err) != codes.NotFound {
+		if err != nil && status.Code(err) != codes.NotFound {
 			return err
 		}
-		return ba.recordPut(location, canonicalKey, lookupKey)
+		if writeErr := ba.recordPut(location, canonicalKey, lookupKey); writeErr != nil {
+			return writeErr
+		}
+		if err == nil && inheritedKey != lookupKey {
+			return ba.keyLocationMap.Put(inheritedKey, location, ba.blockReferenceResolver)
+		}
+		return nil
 	}
 	return ba.finalizePut(putFinalizer, canonicalKey, lookupKey)
 }

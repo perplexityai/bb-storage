@@ -97,9 +97,14 @@ logical bytes retain the validating decode/encode fallback.
 ## Read behavior and fresh-store requirement
 
 - Start with an empty store. Unindexed raw records larger than 4 KiB are rejected.
-  Persistent stores write a durable `storage-format` marker under
-  `persistent.stateDirectoryPath`. Startup refuses a different mode or version
-  before opening the block device. Unmarked `state` or `state.new` files count
+  Persistent stores validate the `storage-format` marker under
+  `persistent.stateDirectoryPath` before opening the block device. After backend
+  construction succeeds, startup writes and syncs `storage-format.new`, renames
+  it atomically, and syncs the directory using the platform filesystem API.
+  Persistence workers start only after publication succeeds. Interrupted
+  temporary writes are removed and retried on the next startup; a damaged
+  committed marker still requires inspection and restoration of the known
+  format. A failed backend configuration does not publish a format marker. Unmarked `state` or `state.new` files count
   as legacy raw state and cannot be opened with compression enabled.
   Tiny raw records produced by this mode receive bounded logical validation.
 - Full compressed reads verify each stored frame's encoded checksum before
@@ -142,8 +147,13 @@ safe rollback mechanism for them.
 Unsupported-version records are not evidence of block corruption. A duplicate
 upload checks the stored index; an unreadable record permits a validated repair
 that replaces its mapping without evicting neighboring blocks, including with
-hierarchical instance names. Presence checks alone may still report such a
-record as present until a read or an explicit repair.
+hierarchical instance names. `FindMissing` probes readable metadata and reports
+unsupported records as missing, so ordinary clients can re-upload them. Transient
+probe errors remain errors; capacity errors do not trigger a repair write. These
+checks add a footer read for stored compressed records and bounded validation
+for tiny raw records. A successful hierarchical repair updates both the requested
+instance entry and an existing inherited entry; losing the inherited entry later
+does not reveal a stale child mapping.
 
 ## Format integrity and bounds
 

@@ -175,8 +175,22 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			digestKeyFormat = creator.GetBaseDigestKeyFormat()
 		}
 		persistent := backend.Local.Persistent
+		var persistentStateDirectory filesystem.DirectoryCloser
+		var publishStorageFormat func() error
+		keepStateDirectory := false
 		if persistent != nil {
-			if err := local.CheckPersistentStorageFormat(persistent.StateDirectoryPath, compression != nil); err != nil {
+			var err error
+			persistentStateDirectory, err = filesystem.NewLocalDirectory(path.LocalFormat.NewParser(persistent.StateDirectoryPath))
+			if err != nil {
+				return BlobAccessInfo{}, "", util.StatusWrapWithCode(err, codes.Internal, "Failed to open persistent state directory")
+			}
+			defer func() {
+				if !keepStateDirectory {
+					persistentStateDirectory.Close()
+				}
+			}()
+			publishStorageFormat, err = local.PreparePersistentStorageFormat(persistentStateDirectory, compression != nil)
+			if err != nil {
 				return BlobAccessInfo{}, "", err
 			}
 		}
@@ -251,6 +265,7 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 		var blockList local.BlockList
 		var keyLocationMapHashInitialization uint64
 		initialBlockCount := 0
+		var startPersistentSyncer func()
 		if persistent == nil {
 			// Persistency is disabled. Provide a simple
 			// volatile BlockList.
@@ -259,10 +274,6 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 		} else {
 			// Persistency is enabled. Reload previous
 			// persistent state from disk.
-			persistentStateDirectory, err := filesystem.NewLocalDirectory(path.LocalFormat.NewParser(persistent.StateDirectoryPath))
-			if err != nil {
-				return BlobAccessInfo{}, "", util.StatusWrapf(err, "Failed to open persistent state directory %#v", persistent.StateDirectoryPath)
-			}
 			persistentStateStore := local.NewDirectoryBackedPersistentStateStore(persistentStateDirectory)
 			persistentState, err := persistentStateStore.ReadPersistentState()
 			if err != nil {
@@ -301,21 +312,23 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 				keyLocationMapHashInitialization,
 				dataSyncer,
 			)
-			// TODO: Run this as part of the program.Group,
-			// so that it gets cleaned up upon shutdown.
-			go func() {
-				for {
-					periodicSyncer.ProcessBlockRelease()
-				}
-			}()
-			nc.terminationGroup.Go(func(ctx context.Context, siblingsGroup, dependenciesGroup program.Group) error {
-				for periodicSyncer.ProcessBlockPut(ctx) {
-				}
-				// TODO: Let PeriodicSyncer propagate errors
-				// upwards in case they occur after the context
-				// has been cancelled.
-				return nil
-			})
+			startPersistentSyncer = func() {
+				// TODO: Run this as part of the program.Group,
+				// so that it gets cleaned up upon shutdown.
+				go func() {
+					for {
+						periodicSyncer.ProcessBlockRelease()
+					}
+				}()
+				nc.terminationGroup.Go(func(ctx context.Context, siblingsGroup, dependenciesGroup program.Group) error {
+					for periodicSyncer.ProcessBlockPut(ctx) {
+					}
+					// TODO: Let PeriodicSyncer propagate errors
+					// upwards in case they occur after the context
+					// has been cancelled.
+					return nil
+				})
+			}
 		}
 
 		blockListGrowthPolicy, err := creator.NewBlockListGrowthPolicy(
@@ -403,6 +416,13 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			if err != nil {
 				return BlobAccessInfo{}, "", err
 			}
+		}
+		if publishStorageFormat != nil {
+			if err := publishStorageFormat(); err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+			startPersistentSyncer()
+			keepStateDirectory = true
 		}
 		return BlobAccessInfo{
 			BlobAccess:      localBlobAccess,

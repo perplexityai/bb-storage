@@ -5,6 +5,7 @@ import (
 	"context"
 	"io"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/klauspost/compress/zstd"
@@ -45,4 +46,26 @@ func TestCodecAcquisitionTimeoutDoesNotLimitCodecLifetime(t *testing.T) {
 	decoder.Close()
 	require.NoError(t, err)
 	require.Equal(t, []byte("after acquisition"), actual)
+}
+
+func TestConfiguredUploadPoolActuallyBoundsAcquisition(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		p, err := NewUploadPoolFromConfiguration(nil, 1)
+		require.NoError(t, err)
+		heldEncoder, err := p.NewEncoder(t.Context(), io.Discard)
+		require.NoError(t, err)
+		defer heldEncoder.Close()
+		heldDecoder, err := p.NewDecoder(t.Context(), nil)
+		require.NoError(t, err)
+		defer heldDecoder.Close()
+		// A caller with a longer deadline must see the pool's timeout first.
+		ctx, cancel := context.WithTimeout(t.Context(), 2*time.Minute)
+		defer cancel()
+		started := time.Now()
+		_, err = p.NewEncoder(ctx, io.Discard)
+		require.Equal(t, codes.ResourceExhausted, status.Code(err))
+		require.Less(t, time.Since(started), time.Minute)
+		_, err = p.NewDecoder(ctx, nil)
+		require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	})
 }

@@ -188,6 +188,9 @@ func (e *EncodingError) Unwrap() error { return e.Err }
 func compressFrame(ctx context.Context, data []byte, frameSize int, pool zstd.Pool) ([]byte, error) {
 	encoded, err := zstd.EncodeFrame(ctx, pool, data)
 	if err != nil {
+		if ctx.Err() != nil && (status.Code(err) == codes.Canceled || status.Code(err) == codes.DeadlineExceeded) {
+			return nil, err
+		}
 		return nil, &EncodingError{Err: err}
 	}
 	if int64(len(encoded)) > encodedLimit(frameSize) {
