@@ -4,17 +4,21 @@ import (
 	"context"
 	"io"
 	"sync"
+	"time"
 
 	"github.com/buildbarn/bb-storage/pkg/util"
 	"github.com/klauspost/compress/zstd"
 	"golang.org/x/sync/semaphore"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type boundedPool struct {
-	encoderPool sync.Pool
-	decoderPool sync.Pool
-	encoderSem  *semaphore.Weighted
-	decoderSem  *semaphore.Weighted
+	encoderPool        sync.Pool
+	decoderPool        sync.Pool
+	encoderSem         *semaphore.Weighted
+	decoderSem         *semaphore.Weighted
+	acquisitionTimeout time.Duration
 }
 
 // NewBoundedPool creates a Pool with memory-bounded concurrency. It
@@ -56,8 +60,24 @@ func NewBoundedPool(
 	return p
 }
 
+func (p *boundedPool) acquire(ctx context.Context, sem *semaphore.Weighted) error {
+	waitCtx := ctx
+	if p.acquisitionTimeout > 0 {
+		var cancel context.CancelFunc
+		waitCtx, cancel = context.WithTimeout(ctx, p.acquisitionTimeout)
+		defer cancel()
+	}
+	if err := util.AcquireSemaphore(waitCtx, sem, 1); err != nil {
+		if ctx.Err() != nil {
+			return contextError(ctx)
+		}
+		return &AcquisitionError{Err: status.Error(codes.ResourceExhausted, "Timed out waiting for codec capacity")}
+	}
+	return nil
+}
+
 func (p *boundedPool) NewEncoder(ctx context.Context, w io.Writer) (Encoder, error) {
-	if err := util.AcquireSemaphore(ctx, p.encoderSem, 1); err != nil {
+	if err := p.acquire(ctx, p.encoderSem); err != nil {
 		return nil, err
 	}
 
@@ -67,7 +87,7 @@ func (p *boundedPool) NewEncoder(ctx context.Context, w io.Writer) (Encoder, err
 }
 
 func (p *boundedPool) NewDecoder(ctx context.Context, r io.Reader) (Decoder, error) {
-	if err := util.AcquireSemaphore(ctx, p.decoderSem, 1); err != nil {
+	if err := p.acquire(ctx, p.decoderSem); err != nil {
 		return nil, err
 	}
 

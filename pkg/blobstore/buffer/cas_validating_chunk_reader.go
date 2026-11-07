@@ -115,3 +115,5 @@ func (r *casValidatingChunkReader) Read() ([]byte, error) {
 	}
 	return chunk, nil
 }
+
+func (r *casValidatingChunkReader) CloseWithError() error { return closeChunkReader(r.ChunkReader) }

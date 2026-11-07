@@ -75,6 +75,18 @@ func (s *codecOrderStorage) Put(ctx context.Context, _ digest.Digest, b buffer.B
 	return err
 }
 
+// Force the logical fallback used by consumers that inspect or transform
+// bytes. Pure forwarding now avoids codec acquisition altogether.
+type logicalCodecOrderBlobAccess struct{ blobstore.BlobAccess }
+
+func (s logicalCodecOrderBlobAccess) Get(ctx context.Context, d digest.Digest) buffer.Buffer {
+	return buffer.NewCASBufferFromReader(d, s.BlobAccess.Get(ctx, d).ToReader(), buffer.BackendProvided(buffer.Irreparable(d)))
+}
+
+func (s logicalCodecOrderBlobAccess) Put(ctx context.Context, d digest.Digest, b buffer.Buffer) error {
+	return s.BlobAccess.Put(ctx, d, buffer.NewCASBufferFromReader(d, b.ToReader(), buffer.UserProvided))
+}
+
 type codecOrderWriteStream struct {
 	bytestream.ByteStream_WriteServer
 	ctx      context.Context
@@ -99,6 +111,11 @@ func (s *codecOrderWriteStream) SendAndClose(response *bytestream.WriteResponse)
 }
 
 func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
+	t.Run("offset_read", func(t *testing.T) { testMixedCodecOrder(t, false) })
+	t.Run("copy", func(t *testing.T) { testMixedCodecOrder(t, true) })
+}
+
+func testMixedCodecOrder(t *testing.T, copyBlob bool) {
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
 	encoderOptions := []zstd.EOption{zstd.WithEncoderConcurrency(1)}
@@ -107,7 +124,7 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	frontendPool := &heldWriteDecoderPool{Pool: shared, acquired: make(chan struct{}), proceed: make(chan struct{})}
 	backendPool := &observedReadDecoderPool{Pool: shared, attempted: make(chan struct{})}
 
-	storage := &codecOrderStorage{written: make(chan []byte, 1)}
+	storage := &codecOrderStorage{written: make(chan []byte, 2)}
 	listener := bufconn.Listen(1 << 20)
 	storageServer := grpc.NewServer()
 	bytestream.RegisterByteStreamServer(storageServer, grpcservers.NewByteStreamServer(storage, 64,
@@ -125,7 +142,7 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	}), grpc.WithInsecure())
 	require.NoError(t, err)
 	defer conn.Close()
-	backend := grpcclients.NewCASBlobAccess(conn, uuid.NewRandom, 64, backendPool)
+	backend := logicalCodecOrderBlobAccess{grpcclients.NewCASBlobAccess(conn, uuid.NewRandom, 64, backendPool)}
 	frontend, err := grpcservers.NewAdmissionControlledByteStreamServer(
 		grpcservers.NewByteStreamServer(backend, 64, frontendPool), 1, 1,
 	)
@@ -152,8 +169,14 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	readStream := &admissionReadStream{ctx: ctx}
 	readDone := make(chan error, 1)
 	go func() {
+		if copyBlob {
+			readDone <- backend.Put(ctx, blobDigest, backend.Get(ctx, blobDigest))
+			return
+		}
 		readDone <- frontend.Read(&bytestream.ReadRequest{
 			ResourceName: blobDigest.GetByteStreamReadPath(remoteexecution.Compressor_ZSTD),
+			// A logical offset requires decoding; full reads now pass through.
+			ReadOffset: 1,
 		}, readStream)
 	}()
 	select {
@@ -184,10 +207,13 @@ func TestByteStreamMixedCompressedCodecOrder(t *testing.T) {
 	case <-ctx.Done():
 		t.Fatal("upload did not reach storage")
 	}
+	if copyBlob {
+		return
+	}
 	decoder, err := zstd.NewReader(nil)
 	require.NoError(t, err)
 	defer decoder.Close()
 	decoded, err := decoder.DecodeAll(readStream.data.Bytes(), nil)
 	require.NoError(t, err)
-	require.Equal(t, []byte("hello"), decoded)
+	require.Equal(t, []byte("ello"), decoded)
 }

@@ -1,0 +1,36 @@
+load("@rules_go//go:def.bzl", "go_library", "go_test")
+
+go_library(
+    name = "zstdframes",
+    srcs = [
+        "representation.go",
+    ],
+    importpath = "github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes",
+    visibility = ["//visibility:public"],
+    deps = [
+        "//pkg/blobstore/compressionmetrics",
+        "//pkg/digest",
+        "//pkg/zstd",
+        "@bazel_remote_apis//build/bazel/remote/execution/v2:remote_execution_go_proto",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+    ],
+)
+
+go_test(
+    name = "zstdframes_test",
+    srcs = [
+        "representation_io_test.go",
+        "representation_test.go",
+    ],
+    embed = [":zstdframes"],
+    deps = [
+        "//pkg/digest",
+        "//pkg/zstd",
+        "@bazel_remote_apis//build/bazel/remote/execution/v2:remote_execution_go_proto",
+        "@com_github_klauspost_compress//zstd",
+        "@com_github_stretchr_testify//require",
+        "@org_golang_google_grpc//codes",
+        "@org_golang_google_grpc//status",
+    ],
+)

@@ -9,6 +9,7 @@ import "github.com/buildbarn/bb-storage/pkg/proto/configuration/digest/digest.pr
 import "github.com/buildbarn/bb-storage/pkg/proto/configuration/grpc/grpc.proto";
 import "github.com/buildbarn/bb-storage/pkg/proto/configuration/http/client/client.proto";
 import "github.com/buildbarn/bb-storage/pkg/proto/configuration/lossymap/lossymap.proto";
+import "github.com/buildbarn/bb-storage/pkg/proto/configuration/zstd/zstd.proto";
 import "google/protobuf/duration.proto";
 import "google/protobuf/empty.proto";
 import "google/protobuf/timestamp.proto";
@@ -608,6 +609,88 @@ message LocalBlobAccessConfiguration {
   // level, e.g., on top of CompletenessCheckingBlobAccess. This can be
   // achieved by using HierarchicalInstanceNamesBlobAccess.
   bool hierarchical_instance_names = 14;
+
+  // When configured for block-device CAS storage, new blobs use compressed
+  // primary records. Start with an empty store; only tiny raw records produced
+  // by this mode are supported. Whole compressed reads need no codecs.
+  // Changing storage mode requires retiring existing cache data.
+  // Encoded checksum validation is always enabled; the block device's
+  // data_integrity_validation_cache is rejected in this mode.
+  //
+  // To enable: stop all processes using this store. Provision a new empty
+  // persistent.state_directory_path, a fresh key-location map file/device, and
+  // fresh block storage (or explicitly reset all three together). Merely deleting
+  // the marker does not convert records. The state directory must contain none of
+  // state, state.new or storage-format from the previous store. Preserve an old
+  // cache only as a separate offline rollback unit; never mix its components with
+  // the new store. For volatile state, also replace/reset its block storage.
+  //
+  // Every persistent backend, including raw stores, atomically writes and fsyncs
+  // a storage-format marker before admitting writes. Existing unmarked raw stores
+  // can remain raw. Unmarked legacy persistent state cannot enable compression.
+  // A marker may remain after a later process startup failure; only reset it when
+  // the entire never-used store is known to be empty. Never remove a live marker
+  // to bypass a mismatch. Interrupted storage-format.new writes are retried.
+  //
+  // Rollback to raw-only readers or another format requires retiring the entire
+  // compressed cache and provisioning fresh state/key-map/block storage. Older
+  // binaries ignore the marker and must not open compressed data. Unknown-version
+  // records fail reads without eviction and remain present in FindMissing;
+  // duplicate uploads do not repair them. Resolve the format mismatch or retire
+  // the cache. A new format starts cold; plan for the resulting upstream load.
+  //
+  // For encoded forwarding, enableCompression must be true on each internal gRPC
+  // CAS client and both servers must advertise ZSTD. Identity-only or retrying
+  // intermediate backends retain logical fallback. Read and upload codec pools
+  // consume separate memory budgets. Measure aggregate CPU when these workloads
+  // share a node, and compare against the current internal-hop compression mode.
+  // Validate workers, cold/warm read latency, errors, CPU, network, staging waits,
+  // and passthrough metrics on an isolated store before expanding a rollout.
+  CASCompression cas_compression = 16;
+
+  message CASCompression {
+    // Existing disk-backed directory supporting unlink of open temporary files.
+    // Do not place this on a memory-backed filesystem. The process must have
+    // enough filesystem capacity in addition to the reservation budget. Uploads
+    // stage only validated output; no input spool or second staging pass is used.
+    // A crash between creation and unlink can leave an empty named temporary
+    // file, but payload writes start only after unlink.
+    string staging_directory = 1;
+    // Bounds reserved temporary disk bytes across active uploads, including
+    // worst-case encoded output with its index. Must accommodate
+    // at least one complete upload; size for concurrent maximum-sized blobs.
+    // Reservation is approximately logical size * 1.125 plus frame/index overhead;
+    // a 256 MiB upload reserves about 289 MiB even if highly compressible. An
+    // upload that can never fit returns INVALID_ARGUMENT. A budget below the
+    // empty-record bound is rejected at startup. Include nested replication
+    // reservations if those flows may target the same destination.
+    int64 maximum_staged_bytes = 2;
+    // Upload codec concurrency budget. Each codec count defaults to this value.
+    // Receiving and queued requests together are capped at four times this
+    // value, including duplicates; full queues return RESOURCE_EXHAUSTED before
+    // duplicate detection. Staging waits last at most 30 seconds or the caller
+    // deadline. Fitting small uploads can pass large waiters; sustained traffic
+    // can starve a large upload until that timeout. Use the staging wait and
+    // rejection metrics to size this budget. Slow clients can fill the finite
+    // receive queue; RPC admission/deadlines are still required.
+    int64 maximum_concurrent_writes = 3;
+    // Separate upload codecs; never shares permits or instances with reads.
+    // Defaults: encoder/decoder counts equal maximum_concurrent_writes,
+    // fastest encoder, 1 MiB encoder window and 8 MiB decoder window.
+    // Counts may be reduced but must not exceed maximum_concurrent_writes.
+    // The full override is retained so encoder/decoder concurrency and memory
+    // can be budgeted independently. Encoder settings also affect CPU and size.
+    // Increase decoder_window_size_bytes explicitly for large-window clients
+    // such as zstd --long, accounting for memory per concurrent decoder.
+    // Unsupported client windows return INVALID_ARGUMENT. Read decoders must be
+    // compatible with stored frames; startup validates this before device open.
+    // Acquisition waits have a 30-second cap, shortened by the caller deadline.
+    // That cap does not interrupt an acquired codec or limit the upload lifetime;
+    // compressed clients hold an upload decoder while receiving bytes. Read-side
+    // decoders remain independent. Already-logical upstream consumers can still
+    // retain their own decoder for the source stream.
+    buildbarn.configuration.zstd.PoolConfiguration upload_zstd_pool = 4;
+  }
 }
 
 message ExistenceCachingBlobAccessConfiguration {

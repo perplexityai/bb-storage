@@ -14,6 +14,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore/readfallback"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/replication"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/sharding"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
 	"github.com/buildbarn/bb-storage/pkg/blockdevice"
 	"github.com/buildbarn/bb-storage/pkg/clock"
 	"github.com/buildbarn/bb-storage/pkg/digest"
@@ -150,11 +151,53 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			DigestKeyFormat: backendA.DigestKeyFormat.Combine(backendB.DigestKeyFormat),
 		}, "mirrored", nil
 	case *pb.BlobAccessConfiguration_Local:
+		compression := backend.Local.CasCompression
+		var compressionPool, uploadPool bb_zstd.Pool
+		if compression != nil {
+			casCreator, ok := creator.(*casBlobAccessCreator)
+			if !ok || backend.Local.GetBlocksOnBlockDevice() == nil {
+				return BlobAccessInfo{}, "", status.Error(codes.InvalidArgument, "CAS compression requires block-device CAS storage")
+			}
+			if backend.Local.GetBlocksOnBlockDevice().DataIntegrityValidationCache != nil {
+				return BlobAccessInfo{}, "", status.Error(codes.InvalidArgument, "CAS compression requires data_integrity_validation_cache to be unset")
+			}
+			compressionPool = casCreator.zstdPool
+			var err error
+			uploadPool, err = bb_zstd.NewUploadPoolFromConfiguration(compression.UploadZstdPool, compression.MaximumConcurrentWrites)
+			if err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+			if err := blobstore.ValidateCompressedCASConfiguration(compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, compressionPool); err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+			if err := bb_zstd.ValidatePoolCompatibility(uploadPool, compressionPool, zstdframes.DefaultFrameSize); err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+		}
 		digestKeyFormat := digest.KeyWithInstance
 		if !backend.Local.HierarchicalInstanceNames {
 			digestKeyFormat = creator.GetBaseDigestKeyFormat()
 		}
 		persistent := backend.Local.Persistent
+		var persistentStateDirectory filesystem.DirectoryCloser
+		var publishStorageFormat func() error
+		keepStateDirectory := false
+		if persistent != nil {
+			var err error
+			persistentStateDirectory, err = filesystem.NewLocalDirectory(path.LocalFormat.NewParser(persistent.StateDirectoryPath))
+			if err != nil {
+				return BlobAccessInfo{}, "", util.StatusWrapWithCode(err, codes.Internal, "Failed to open persistent state directory "+persistent.StateDirectoryPath)
+			}
+			defer func() {
+				if !keepStateDirectory {
+					persistentStateDirectory.Close()
+				}
+			}()
+			publishStorageFormat, err = local.PreparePersistentStorageFormat(persistentStateDirectory, compression != nil)
+			if err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+		}
 
 		// Create the backing store for blocks of data.
 		var backendType string
@@ -200,9 +243,14 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 				return BlobAccessInfo{}, "", status.Errorf(codes.InvalidArgument, "Block device only has %d sectors (%d bytes each), which is less than the total number of blocks (%d), meaning this backend would be incapable of storing any data", sectorCount, sectorSizeBytes, blockCount)
 			}
 
-			cachedReadBufferFactory, err := newCachedReadBufferFactory(blocksOnBlockDevice.DataIntegrityValidationCache, readBufferFactory, digestKeyFormat)
-			if err != nil {
-				return BlobAccessInfo{}, "", err
+			var cachedReadBufferFactory blobstore.ReadBufferFactory
+			if compression != nil {
+				cachedReadBufferFactory = blobstore.NewCompressedCASReadBufferFactory(compressionPool)
+			} else {
+				cachedReadBufferFactory, err = newCachedReadBufferFactory(blocksOnBlockDevice.DataIntegrityValidationCache, readBufferFactory, digestKeyFormat)
+				if err != nil {
+					return BlobAccessInfo{}, "", err
+				}
 			}
 
 			blockAllocator = local.NewBlockDeviceBackedBlockAllocator(
@@ -221,6 +269,7 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 		var blockList local.BlockList
 		var keyLocationMapHashInitialization uint64
 		initialBlockCount := 0
+		var startPersistentSyncer func()
 		if persistent == nil {
 			// Persistency is disabled. Provide a simple
 			// volatile BlockList.
@@ -229,10 +278,6 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 		} else {
 			// Persistency is enabled. Reload previous
 			// persistent state from disk.
-			persistentStateDirectory, err := filesystem.NewLocalDirectory(path.LocalFormat.NewParser(persistent.StateDirectoryPath))
-			if err != nil {
-				return BlobAccessInfo{}, "", util.StatusWrapf(err, "Failed to open persistent state directory %#v", persistent.StateDirectoryPath)
-			}
 			persistentStateStore := local.NewDirectoryBackedPersistentStateStore(persistentStateDirectory)
 			persistentState, err := persistentStateStore.ReadPersistentState()
 			if err != nil {
@@ -271,21 +316,23 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 				keyLocationMapHashInitialization,
 				dataSyncer,
 			)
-			// TODO: Run this as part of the program.Group,
-			// so that it gets cleaned up upon shutdown.
-			go func() {
-				for {
-					periodicSyncer.ProcessBlockRelease()
-				}
-			}()
-			nc.terminationGroup.Go(func(ctx context.Context, siblingsGroup, dependenciesGroup program.Group) error {
-				for periodicSyncer.ProcessBlockPut(ctx) {
-				}
-				// TODO: Let PeriodicSyncer propagate errors
-				// upwards in case they occur after the context
-				// has been cancelled.
-				return nil
-			})
+			startPersistentSyncer = func() {
+				// TODO: Run this as part of the program.Group,
+				// so that it gets cleaned up upon shutdown.
+				go func() {
+					for {
+						periodicSyncer.ProcessBlockRelease()
+					}
+				}()
+				nc.terminationGroup.Go(func(ctx context.Context, siblingsGroup, dependenciesGroup program.Group) error {
+					for periodicSyncer.ProcessBlockPut(ctx) {
+					}
+					// TODO: Let PeriodicSyncer propagate errors
+					// upwards in case they occur after the context
+					// has been cancelled.
+					return nil
+				})
+			}
 		}
 
 		blockListGrowthPolicy, err := creator.NewBlockListGrowthPolicy(
@@ -367,6 +414,19 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 				storageTypeName,
 				creator.GetDefaultCapabilitiesProvider(),
 			)
+		}
+		if compression != nil {
+			localBlobAccess, err = blobstore.NewCompressedCASBlobAccess(localBlobAccess, compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, uploadPool)
+			if err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+		}
+		if publishStorageFormat != nil {
+			if err := publishStorageFormat(); err != nil {
+				return BlobAccessInfo{}, "", err
+			}
+			startPersistentSyncer()
+			keepStateDirectory = true
 		}
 		return BlobAccessInfo{
 			BlobAccess:      localBlobAccess,

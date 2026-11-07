@@ -148,3 +148,5 @@ func (eh backendNamePrefixingErrorHandler) OnError(err error) (buffer.Buffer, er
 }
 
 func (backendNamePrefixingErrorHandler) Done() {}
+
+func (backendNamePrefixingErrorHandler) NonRetrying() {}

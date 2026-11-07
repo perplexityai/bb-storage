@@ -27,3 +27,10 @@ type Pool interface {
 	NewEncoder(ctx context.Context, w io.Writer) (Encoder, error)
 	NewDecoder(ctx context.Context, r io.Reader) (Decoder, error)
 }
+
+// AcquisitionError identifies local codec admission failure, rather than a
+// failure reading or decoding the source. Callers must not repair the source.
+type AcquisitionError struct{ Err error }
+
+func (e *AcquisitionError) Error() string { return e.Err.Error() }
+func (e *AcquisitionError) Unwrap() error { return e.Err }

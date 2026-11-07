@@ -176,6 +176,8 @@ type metricsErrorHandler struct {
 	durationSeconds prometheus.ObserverVec
 }
 
+func (*metricsErrorHandler) NonRetrying() {}
+
 func (eh *metricsErrorHandler) OnError(err error) (buffer.Buffer, error) {
 	eh.errorCode = status.Code(err)
 	return nil, err

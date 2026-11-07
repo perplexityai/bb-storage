@@ -184,7 +184,7 @@ func (ba *flatBlobAccess) Get(ctx context.Context, blobDigest digest.Digest) buf
 	// has finished to apply back-pressure.
 	b1, b2 := b.CloneStream()
 	return b1.WithTask(func() error {
-		putFinalizer := putWriter(b2)
+		putFinalizer := putWriter(buffer.ForLocalRefresh(b2))
 		ba.lock.Lock()
 		_, err := ba.finalizePut(putFinalizer, key)
 		if err == nil {
@@ -262,7 +262,7 @@ func (ba *flatBlobAccess) GetFromComposite(ctx context.Context, parentDigest, ch
 		// Copy the data while it's being sliced.
 		bParent1, bParent2 := bParent.CloneStream()
 		bParentSlicing = bParent1.WithTask(func() error {
-			putFinalizer = putWriter(bParent2)
+			putFinalizer = putWriter(buffer.ForLocalRefresh(bParent2))
 			return nil
 		})
 	} else {
@@ -425,7 +425,7 @@ func (ba *flatBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (
 				// Copy the data while unlocked, so that
 				// concurrent requests for other data
 				// continue to be serviced.
-				putFinalizer := putWriter(b)
+				putFinalizer := putWriter(buffer.ForLocalRefresh(b))
 
 				ba.lock.Lock()
 				if _, err := ba.finalizePut(putFinalizer, blobToRefresh.key); err != nil {

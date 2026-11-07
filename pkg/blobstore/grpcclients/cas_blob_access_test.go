@@ -1,7 +1,9 @@
 package grpcclients_test
 
 import (
+	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"sync"
 	"testing"
@@ -502,8 +504,8 @@ func TestCASBlobAccessGetWithCompression(t *testing.T) {
 	})
 }
 
-func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
-	// Create a pool with only 1 concurrent encoder to test backpressure.
+func TestCASBlobAccessSlowDestinationReleasesEncoder(t *testing.T) {
+	// A slow transport must not occupy the only encoder.
 	pool := bb_zstd.NewBoundedPool(1, 1, nil, nil)
 
 	ctrl, ctx := gomock.WithContext(context.Background(), t)
@@ -520,7 +522,7 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 	blobDigest := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "1411ffd5854fa029dc4d231aa89311eb", 1000)
 	testUUID := uuid.Must(uuid.Parse("7d659e5f-0e4b-48f0-ad9f-3489db6e103b"))
 
-	// Hold the only encoder slot by starting a Put that blocks on SendMsg.
+	// Start an upload whose destination stops reading.
 	sendBlocked := make(chan struct{})
 	sendUnblock := make(chan struct{})
 
@@ -535,7 +537,7 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 	})
 	r1.EXPECT().Close()
 
-	// First SendMsg blocks, holding the encoder slot.
+	// First SendMsg blocks after the encoded frame has released its codec.
 	clientStream1.EXPECT().SendMsg(gomock.Any()).DoAndReturn(func(msg interface{}) error {
 		close(sendBlocked)
 		<-sendUnblock
@@ -553,28 +555,30 @@ func TestCASBlobAccessPutPoolExhaustion(t *testing.T) {
 		require.NoError(t, err)
 	}()
 
-	// Wait for the first Put to acquire the encoder and block on SendMsg.
+	// Wait for the first upload to block at its destination.
 	<-sendBlocked
 
-	// Second Put should fail because the pool is exhausted and the context expires.
-	shortCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	// Another upload must still be able to acquire the encoder and complete.
+	shortCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 
 	r2 := mock.NewMockFileReader(ctrl)
+	r2.EXPECT().ReadAt(gomock.Len(1000), int64(0)).DoAndReturn(func(p []byte, off int64) (int, error) {
+		copy(p, largeData)
+		return 1000, nil
+	})
 	r2.EXPECT().Close()
 
-	// This Put needs a new stream — but it will fail before using it because
-	// AcquireEncoder blocks and the context times out.
 	clientStream2 := mock.NewMockClientStream(ctrl)
 	uuidGenerator.EXPECT().Call().Return(testUUID, nil)
 	client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Write").
 		Return(clientStream2, nil)
-	clientStream2.EXPECT().CloseSend().Return(nil).AnyTimes()
-	clientStream2.EXPECT().RecvMsg(gomock.Any()).Return(nil).AnyTimes()
+	clientStream2.EXPECT().SendMsg(gomock.Any()).Return(nil).Times(2)
+	clientStream2.EXPECT().CloseSend().Return(nil)
+	clientStream2.EXPECT().RecvMsg(gomock.Any()).Return(nil)
 
 	err := blobAccess.Put(shortCtx, blobDigest, buffer.NewValidatedBufferFromReaderAt(r2, 1000))
-	require.Error(t, err)
-	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.NoError(t, err)
 
 	// Unblock the first Put so it can complete.
 	close(sendUnblock)
@@ -661,5 +665,95 @@ func TestCASBlobAccessGetPoolReleasesDecoder(t *testing.T) {
 		data, err := buf.ToByteSlice(1500)
 		require.NoError(t, err, "Get #%d should succeed", i+1)
 		require.Equal(t, expectedData, data)
+	}
+}
+
+func TestCASBlobAccessEarlySuccessPreservesSourceCompletion(t *testing.T) {
+	for _, compressed := range []bool{false, true} {
+		for _, adapter := range []string{"direct", "reader", "chunk-buffer"} {
+			t.Run(fmt.Sprintf("compressed=%t/adapter=%s", compressed, adapter), func(t *testing.T) {
+				ctrl, ctx := gomock.WithContext(t.Context(), t)
+				client := mock.NewMockClientConnInterface(ctrl)
+				stream := mock.NewMockClientStream(ctrl)
+				client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Write").Return(stream, nil)
+				// Model a peer accepting an existing blob before the next data message.
+				// Send's EOF is not the RPC result; Recv supplies successful completion.
+				stream.EXPECT().SendMsg(gomock.Any()).Return(io.EOF)
+				stream.EXPECT().CloseSend().Return(nil)
+				stream.EXPECT().RecvMsg(gomock.Any()).Return(nil)
+				var pool bb_zstd.Pool
+				if compressed {
+					pool = newTestZstdPool(1, 1)
+					expectGetCapabilitiesWithZSTD(client)
+				}
+				ba := grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 2, pool)
+				data := bytes.Repeat([]byte("Hello"), 300000)
+				g := digest.MustNewFunction("hello", remoteexecution.DigestFunction_MD5).NewGenerator(int64(len(data)))
+				g.Write(data)
+				d := g.Sum()
+				expected := status.Error(codes.Unavailable, "Background completion failed")
+				b := buffer.NewCASBufferFromReader(d, io.NopCloser(bytes.NewReader(data)), buffer.UserProvided).WithTask(func() error { return expected })
+				switch adapter {
+				case "reader":
+					b = buffer.NewCASBufferFromReader(d, buffer.NewReaderFromChunkReader(b.ToChunkReader(0, 4096)), buffer.UserProvided)
+				case "chunk-buffer":
+					b = buffer.NewCASBufferFromChunkReader(d, b.ToChunkReader(0, 4096), buffer.UserProvided)
+					b = buffer.NewCASBufferFromReader(d, buffer.NewReaderFromChunkReader(b.ToChunkReader(0, 4096)), buffer.UserProvided)
+				}
+				require.Equal(t, expected, ba.Put(ctx, d, b))
+			})
+		}
+	}
+}
+
+type independentlyFailedUpload struct {
+	started     chan struct{}
+	interrupted chan struct{}
+	err         error
+}
+
+func (r *independentlyFailedUpload) Read([]byte) (int, error) {
+	close(r.started)
+	<-r.interrupted
+	return 0, r.err
+}
+func (*independentlyFailedUpload) Close() error            { return nil }
+func (r *independentlyFailedUpload) ReadInterrupt() func() { return func() { close(r.interrupted) } }
+
+func TestCASBlobAccessEarlySuccessPreservesIndependentSourceFailure(t *testing.T) {
+	for _, compressed := range []bool{false, true} {
+		for _, code := range []codes.Code{codes.Canceled, codes.DeadlineExceeded, codes.DataLoss} {
+			t.Run(fmt.Sprintf("compressed=%t/code=%s", compressed, code), func(t *testing.T) {
+				ctrl, ctx := gomock.WithContext(t.Context(), t)
+				ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+				defer cancel()
+				expected := status.Error(code, "Independent source failure")
+				r := &independentlyFailedUpload{started: make(chan struct{}), interrupted: make(chan struct{}), err: expected}
+				client := mock.NewMockClientConnInterface(ctrl)
+				stream := mock.NewMockClientStream(ctrl)
+				client.EXPECT().NewStream(gomock.Any(), gomock.Any(), "/google.bytestream.ByteStream/Write").Return(stream, nil)
+				stream.EXPECT().SendMsg(gomock.Any()).Return(nil)
+				stream.EXPECT().CloseSend().Return(nil)
+				stream.EXPECT().RecvMsg(gomock.Any()).DoAndReturn(func(any) error {
+					select {
+					case <-r.started:
+						return nil
+					case <-ctx.Done():
+						return status.FromContextError(ctx.Err()).Err()
+					}
+				})
+				var pool bb_zstd.Pool
+				if compressed {
+					pool = newTestZstdPool(1, 1)
+					expectGetCapabilitiesWithZSTD(client)
+				}
+				ba := grpcclients.NewCASBlobAccess(client, uuid.NewRandom, 4096, pool)
+				d := digest.MustNewDigest("hello", remoteexecution.DigestFunction_MD5, "8b1a9953c4611296a827abf8c47804d7", 5)
+				// Cancellation at the destination must not relabel an independently
+				// failed source merely because both errors use the same status code.
+				require.Equal(t, expected, ba.Put(ctx, d, buffer.NewCASBufferFromReader(d, r, buffer.UserProvided)))
+				require.NoError(t, ctx.Err())
+			})
+		}
 	}
 }

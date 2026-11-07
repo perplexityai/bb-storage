@@ -81,3 +81,5 @@ func (eh *contextCancelingErrorHandler) Done() {
 	eh.cancel()
 	eh.cancel = nil
 }
+
+func (*contextCancelingErrorHandler) NonRetrying() {}

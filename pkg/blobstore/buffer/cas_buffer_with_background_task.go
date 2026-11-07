@@ -47,8 +47,10 @@ func newCASBufferWithBackgroundTask(base Buffer, digest digest.Digest, source So
 
 func (b *casBufferWithBackgroundTask) decorateBuffer(replacement Buffer) Buffer {
 	return &casBufferWithBackgroundTask{
-		base: replacement,
-		task: b.task,
+		base:   replacement,
+		digest: b.digest,
+		source: b.source,
+		task:   b.task,
 	}
 }
 
@@ -149,8 +151,9 @@ func (b *casBufferWithBackgroundTask) toUnvalidatedReader(off int64) io.ReadClos
 }
 
 type chunkReaderWithBackgroundTask struct {
-	r    ChunkReader
-	task *backgroundTask
+	r        ChunkReader
+	task     *backgroundTask
+	closeErr error
 }
 
 func (r *chunkReaderWithBackgroundTask) Read() ([]byte, error) {
@@ -160,18 +163,24 @@ func (r *chunkReaderWithBackgroundTask) Read() ([]byte, error) {
 		}
 		r.Close()
 	}
-	if err := r.task.err; err != nil {
+	if err := r.CloseWithError(); err != nil {
 		return nil, err
 	}
 	return nil, io.EOF
 }
 
-func (r *chunkReaderWithBackgroundTask) Close() {
+func (r *chunkReaderWithBackgroundTask) Close() { r.CloseWithError() }
+
+func (r *chunkReaderWithBackgroundTask) CloseWithError() error {
 	if r.r != nil {
-		r.r.Close()
+		r.closeErr = closeChunkReader(r.r)
 		r.r = nil
 		<-r.task.completion
 	}
+	if r.closeErr != nil {
+		return r.closeErr
+	}
+	return r.task.err
 }
 
 type readerWithBackgroundTask struct {
