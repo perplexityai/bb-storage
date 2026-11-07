@@ -1,4 +1,4 @@
-package zstdframes_test
+package zstdframes
 
 import (
 	"bytes"
@@ -17,7 +17,6 @@ import (
 	"time"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
-	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 	"github.com/klauspost/compress/zstd"
@@ -61,7 +60,7 @@ func encode(t *testing.T, data []byte, frameSize int, pool bb_zstd.Pool) ([]byte
 	t.Helper()
 	d := blobDigest(data, remoteexecution.DigestFunction_SHA256)
 	var b bytes.Buffer
-	require.NoError(t, zstdframes.Encode(context.Background(), &b, d, bytes.NewReader(data), frameSize, pool))
+	require.NoError(t, Encode(context.Background(), &b, d, bytes.NewReader(data), frameSize, pool))
 	return b.Bytes(), d
 }
 
@@ -87,7 +86,7 @@ func TestDiskRoundTripAndParallelFrames(t *testing.T) {
 	f, err := os.Open(path)
 	require.NoError(t, err)
 	defer f.Close()
-	r, err := zstdframes.Open(f, int64(len(encoded)), d)
+	r, err := Open(f, int64(len(encoded)), d)
 	require.NoError(t, err)
 	encoders, decoders := pool.encoders.Load(), pool.decoders.Load()
 
@@ -102,7 +101,7 @@ func TestDiskRoundTripAndParallelFrames(t *testing.T) {
 	require.Equal(t, encoders, pool.encoders.Load())
 	require.Equal(t, decoders, pool.decoders.Load())
 
-	digests := r.FrameDigests()
+	digests := r.frameDigests()
 	parts := make([][]byte, len(digests))
 	errs := make([]error, len(digests))
 	var wg sync.WaitGroup
@@ -122,7 +121,7 @@ func TestDiskRoundTripAndParallelFrames(t *testing.T) {
 	for _, off := range []int64{0, 1, frameSize, frameSize + 17, int64(len(data)) - 1, int64(len(data))} {
 		before := pool.decoders.Load()
 		var raw bytes.Buffer
-		require.NoError(t, r.WriteIdentity(ctx, &raw, off, pool))
+		require.NoError(t, r.writeIdentity(ctx, &raw, off, pool))
 		require.True(t, bytes.Equal(data[off:], raw.Bytes()))
 		want := int64(len(digests)) - off/frameSize
 		if off == int64(len(data)) {
@@ -143,13 +142,13 @@ func TestIncompressibleAndEmptyBlobs(t *testing.T) {
 			pool := newPool()
 			d := blobDigest(data, function)
 			var stored bytes.Buffer
-			require.NoError(t, zstdframes.Encode(context.Background(), &stored, d, bytes.NewReader(data), 64<<10, pool))
-			r, err := zstdframes.Open(bytes.NewReader(stored.Bytes()), int64(stored.Len()), d)
+			require.NoError(t, Encode(context.Background(), &stored, d, bytes.NewReader(data), 64<<10, pool))
+			r, err := Open(bytes.NewReader(stored.Bytes()), int64(stored.Len()), d)
 			require.NoError(t, err)
 			var compressed, identity bytes.Buffer
 			require.NoError(t, r.WriteCompressed(context.Background(), &compressed))
 			require.True(t, bytes.Equal(data, decode(t, compressed.Bytes())))
-			require.NoError(t, r.WriteIdentity(context.Background(), &identity, 0, pool))
+			require.NoError(t, r.writeIdentity(context.Background(), &identity, 0, pool))
 			require.Equal(t, data, identity.Bytes())
 		}
 	}
@@ -179,18 +178,18 @@ func TestFailedUploadsNeverProduceReadableRepresentations(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			var out bytes.Buffer
-			err := zstdframes.Encode(context.Background(), &out, d, src, 4096, newPool())
+			err := Encode(context.Background(), &out, d, src, 4096, newPool())
 			require.Error(t, err)
 			if name == "deferred error" {
 				require.ErrorIs(t, err, errSource)
 			}
-			_, err = zstdframes.Open(bytes.NewReader(out.Bytes()), int64(out.Len()), d)
+			_, err = Open(bytes.NewReader(out.Bytes()), int64(out.Len()), d)
 			require.Error(t, err)
 		})
 	}
 	errDisk := errors.New("disk full")
-	require.ErrorIs(t, zstdframes.Encode(context.Background(), failWriter{errDisk}, d, bytes.NewReader(data), 4096, newPool()), errDisk)
-	require.ErrorIs(t, zstdframes.Encode(context.Background(), shortWriter{}, d, bytes.NewReader(data), 4096, newPool()), io.ErrShortWrite)
+	require.ErrorIs(t, Encode(context.Background(), failWriter{errDisk}, d, bytes.NewReader(data), 4096, newPool()), errDisk)
+	require.ErrorIs(t, Encode(context.Background(), shortWriter{}, d, bytes.NewReader(data), 4096, newPool()), io.ErrShortWrite)
 }
 
 func TestCorruptionAndCancellation(t *testing.T) {
@@ -200,40 +199,40 @@ func TestCorruptionAndCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	var out bytes.Buffer
-	require.Equal(t, codes.Canceled, status.Code(zstdframes.Encode(ctx, &out, d, bytes.NewReader(data), 4096, pool)))
+	require.Equal(t, codes.Canceled, status.Code(Encode(ctx, &out, d, bytes.NewReader(data), 4096, pool)))
 	require.Zero(t, out.Len())
-	r, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
+	r, err := Open(bytes.NewReader(encoded), int64(len(encoded)), d)
 	require.NoError(t, err)
 	require.Equal(t, codes.Canceled, status.Code(r.WriteCompressed(ctx, &out)))
-	require.Equal(t, codes.Canceled, status.Code(r.WriteIdentity(ctx, &out, 0, pool)))
+	require.Equal(t, codes.Canceled, status.Code(r.writeIdentity(ctx, &out, 0, pool)))
 	require.Zero(t, out.Len())
 
 	corrupt := bytes.Clone(encoded)
 	corrupt[0] ^= 1
-	r, err = zstdframes.Open(bytes.NewReader(corrupt), int64(len(corrupt)), d)
+	r, err = Open(bytes.NewReader(corrupt), int64(len(corrupt)), d)
 	require.NoError(t, err)
 	require.Equal(t, codes.DataLoss, status.Code(r.WriteCompressed(context.Background(), &out)))
 	require.Zero(t, out.Len(), "a corrupt frame must not be partially sent")
 	before := pool.decoders.Load()
-	require.Equal(t, codes.DataLoss, status.Code(r.WriteIdentity(context.Background(), &out, 0, pool)))
+	require.Equal(t, codes.DataLoss, status.Code(r.writeIdentity(context.Background(), &out, 0, pool)))
 	require.Equal(t, before, pool.decoders.Load())
 
 	corrupt = bytes.Clone(encoded)
 	corrupt[len(corrupt)-1] ^= 1
-	_, err = zstdframes.Open(bytes.NewReader(corrupt), int64(len(corrupt)), d)
+	_, err = Open(bytes.NewReader(corrupt), int64(len(corrupt)), d)
 	require.Equal(t, codes.DataLoss, status.Code(err))
-	_, err = zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), blobDigest([]byte("other blob"), remoteexecution.DigestFunction_SHA256))
+	_, err = Open(bytes.NewReader(encoded), int64(len(encoded)), blobDigest([]byte("other blob"), remoteexecution.DigestFunction_SHA256))
 	require.Equal(t, codes.DataLoss, status.Code(err))
-	r, err = zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
+	r, err = Open(bytes.NewReader(encoded), int64(len(encoded)), d)
 	require.NoError(t, err)
 	errNetwork := errors.New("client disconnected")
 	require.ErrorIs(t, r.WriteCompressed(context.Background(), failWriter{errNetwork}), errNetwork)
-	require.ErrorIs(t, r.WriteIdentity(context.Background(), failWriter{errNetwork}, 0, pool), errNetwork)
 	require.ErrorIs(t, r.WriteCompressed(context.Background(), shortWriter{}), io.ErrShortWrite)
 	for _, off := range []int64{-1, int64(len(data)) + 1} {
-		require.Equal(t, codes.InvalidArgument, status.Code(r.WriteIdentity(context.Background(), &out, off, pool)))
+		_, _, err := r.ReadFrameAt(context.Background(), off, false, pool)
+		require.Equal(t, codes.OutOfRange, status.Code(err))
 	}
-	for _, i := range []int{-1, len(r.FrameDigests())} {
+	for _, i := range []int{-1, len(r.frameDigests())} {
 		_, err := r.ReadCompressedFrame(context.Background(), i)
 		require.Equal(t, codes.OutOfRange, status.Code(err))
 	}
@@ -277,13 +276,13 @@ func TestIndexRejectsUnsafeRanges(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			bad := rewriteIndex(t, encoded, modify)
-			_, err := zstdframes.Open(bytes.NewReader(bad), int64(len(bad)), d)
+			_, err := Open(bytes.NewReader(bad), int64(len(bad)), d)
 			require.Equal(t, codes.DataLoss, status.Code(err))
 		})
 	}
 	bad := bytes.Clone(encoded)
 	binary.LittleEndian.PutUint64(bad[len(bad)-40:len(bad)-32], ^uint64(0))
-	_, err := zstdframes.Open(bytes.NewReader(bad), int64(len(bad)), d)
+	_, err := Open(bytes.NewReader(bad), int64(len(bad)), d)
 	require.Equal(t, codes.DataLoss, status.Code(err))
 }
 
@@ -294,9 +293,9 @@ func TestEncodingBudgetsAndIndexEntryLimit(t *testing.T) {
 	require.NoError(t, err)
 	errSource := errors.New("input must not be read")
 	for _, size := range []int{0, 4095, (4 << 20) + 1} {
-		require.Equal(t, codes.InvalidArgument, status.Code(zstdframes.Encode(context.Background(), io.Discard, d, errorReader{errSource}, size, pool)))
+		require.Equal(t, codes.InvalidArgument, status.Code(Encode(context.Background(), io.Discard, d, errorReader{errSource}, size, pool)))
 	}
-	require.Equal(t, codes.InvalidArgument, status.Code(zstdframes.Encode(context.Background(), io.Discard, tooLarge, errorReader{errSource}, 4096, pool)))
+	require.Equal(t, codes.InvalidArgument, status.Code(Encode(context.Background(), io.Discard, tooLarge, errorReader{errSource}, 4096, pool)))
 	require.Zero(t, pool.encoders.Load())
 	encoded, d := encode(t, []byte("small"), 4096, pool)
 	bad := rewriteIndex(t, encoded, func(m map[string]any) {
@@ -306,7 +305,7 @@ func TestEncodingBudgetsAndIndexEntryLimit(t *testing.T) {
 		}
 		m["frames"] = frames
 	})
-	_, err = zstdframes.Open(bytes.NewReader(bad), int64(len(bad)), d)
+	_, err = Open(bytes.NewReader(bad), int64(len(bad)), d)
 	require.Equal(t, codes.DataLoss, status.Code(err))
 }
 
@@ -314,7 +313,7 @@ func FuzzOpen(f *testing.F) {
 	data := []byte("frame index fuzz seed")
 	d := blobDigest(data, remoteexecution.DigestFunction_SHA256)
 	var encoded bytes.Buffer
-	if err := zstdframes.Encode(context.Background(), &encoded, d, bytes.NewReader(data), 4096, newPool()); err != nil {
+	if err := Encode(context.Background(), &encoded, d, bytes.NewReader(data), 4096, newPool()); err != nil {
 		f.Fatal(err)
 	}
 	f.Add(encoded.Bytes())
@@ -323,18 +322,18 @@ func FuzzOpen(f *testing.F) {
 		if len(data) > 1<<20 {
 			t.Skip()
 		}
-		r, err := zstdframes.Open(bytes.NewReader(data), int64(len(data)), d)
+		r, err := Open(bytes.NewReader(data), int64(len(data)), d)
 		if bytes.Equal(data, encoded.Bytes()) {
 			require.NoError(t, err)
 			var decoded bytes.Buffer
-			require.NoError(t, r.WriteIdentity(context.Background(), &decoded, 0, newPool()))
+			require.NoError(t, r.writeIdentity(context.Background(), &decoded, 0, newPool()))
 			require.Equal(t, []byte("frame index fuzz seed"), decoded.Bytes())
 		}
 		if err == nil {
 			// A parser success must never turn into a panic or unbounded range
 			// when consuming the representation.
 			_ = r.WriteCompressed(context.Background(), io.Discard)
-			_ = r.WriteIdentity(context.Background(), io.Discard, 0, newPool())
+			_ = r.writeIdentity(context.Background(), io.Discard, 0, newPool())
 		}
 	})
 }
@@ -343,7 +342,7 @@ func FuzzIndex(f *testing.F) {
 	data := bytes.Repeat([]byte("index parser fuzz seed"), 500)
 	d := blobDigest(data, remoteexecution.DigestFunction_SHA256)
 	var encoded bytes.Buffer
-	if err := zstdframes.Encode(context.Background(), &encoded, d, bytes.NewReader(data), 4096, newPool()); err != nil {
+	if err := Encode(context.Background(), &encoded, d, bytes.NewReader(data), 4096, newPool()); err != nil {
 		f.Fatal(err)
 	}
 	stored := encoded.Bytes()
@@ -361,11 +360,11 @@ func FuzzIndex(f *testing.F) {
 		// Keep length and checksum valid so mutations reach JSON and structural
 		// validation instead of stopping at the corruption-detection gate.
 		candidate := replaceIndex(stored, metadata)
-		r, err := zstdframes.Open(bytes.NewReader(candidate), int64(len(candidate)), d)
+		r, err := Open(bytes.NewReader(candidate), int64(len(candidate)), d)
 		if bytes.Equal(metadata, validIndex) {
 			require.NoError(t, err)
 			var identity bytes.Buffer
-			require.NoError(t, r.WriteIdentity(context.Background(), &identity, 0, newPool()))
+			require.NoError(t, r.writeIdentity(context.Background(), &identity, 0, newPool()))
 			require.Equal(t, data, identity.Bytes())
 		}
 		if err == nil {
@@ -375,7 +374,7 @@ func FuzzIndex(f *testing.F) {
 				// must still reproduce the original logical bytes.
 				require.Equal(t, data, decode(t, compressed.Bytes()))
 			}
-			_ = r.WriteIdentity(context.Background(), io.Discard, 0, newPool())
+			_ = r.writeIdentity(context.Background(), io.Discard, 0, newPool())
 		}
 	})
 }
@@ -413,14 +412,14 @@ func TestCodecReleaseAndMidstreamCancellation(t *testing.T) {
 	data := bytes.Repeat([]byte("frame"), 3000)
 	pool := newPool()
 	encoded, d := encode(t, data, 4096, pool)
-	r, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
+	r, err := Open(bytes.NewReader(encoded), int64(len(encoded)), d)
 	require.NoError(t, err)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	part, err := r.ReadCompressedFrame(ctx, 0)
 	require.NoError(t, err)
 	var result bytes.Buffer
-	err = r.WriteIdentity(ctx, writerFunc(func(p []byte) (int, error) {
+	err = r.writeIdentity(ctx, writerFunc(func(p []byte) (int, error) {
 		// The one-slot pool must already be available when a consumer writes.
 		decoder, err := pool.NewDecoder(ctx, bytes.NewReader(part))
 		if err != nil {
@@ -443,10 +442,10 @@ func TestCodecReleaseAndMidstreamCancellation(t *testing.T) {
 	require.Equal(t, 1, writes)
 	flushError := errors.New("encoder final flush failed")
 	var out bytes.Buffer
-	require.ErrorIs(t, zstdframes.Encode(context.Background(), &out, d, bytes.NewReader(data), 4096, closeErrorPool{pool, flushError}), flushError)
+	require.ErrorIs(t, Encode(context.Background(), &out, d, bytes.NewReader(data), 4096, closeErrorPool{pool, flushError}), flushError)
 	require.Zero(t, out.Len())
 	// Failed closure also returns the encoder to the bounded pool.
-	require.NoError(t, zstdframes.Encode(ctx, &out, d, bytes.NewReader(data), 4096, pool))
+	require.NoError(t, Encode(ctx, &out, d, bytes.NewReader(data), 4096, pool))
 }
 
 func BenchmarkRepresentationReads(b *testing.B) {
@@ -460,10 +459,10 @@ func BenchmarkRepresentationReads(b *testing.B) {
 	d := blobDigest(data, remoteexecution.DigestFunction_SHA256)
 	pool := newPool()
 	var stored bytes.Buffer
-	if err := zstdframes.Encode(ctx, &stored, d, bytes.NewReader(data), 1<<20, pool); err != nil {
+	if err := Encode(ctx, &stored, d, bytes.NewReader(data), 1<<20, pool); err != nil {
 		b.Fatal(err)
 	}
-	r, err := zstdframes.Open(bytes.NewReader(stored.Bytes()), int64(stored.Len()), d)
+	r, err := Open(bytes.NewReader(stored.Bytes()), int64(stored.Len()), d)
 	if err != nil {
 		b.Fatal(err)
 	}
@@ -480,7 +479,7 @@ func BenchmarkRepresentationReads(b *testing.B) {
 		b.SetBytes(int64(len(data)))
 		b.ReportAllocs()
 		for b.Loop() {
-			if err := r.WriteIdentity(ctx, io.Discard, 0, pool); err != nil {
+			if err := r.writeIdentity(ctx, io.Discard, 0, pool); err != nil {
 				b.Fatal(err)
 			}
 		}
@@ -491,21 +490,21 @@ func TestIndependentIndexIdentityChecks(t *testing.T) {
 	data := bytes.Repeat([]byte("identity"), 1000)
 	encoded, d := encode(t, data, 4096, newPool())
 	wrong := blobDigest(bytes.Repeat([]byte("y"), len(data)), remoteexecution.DigestFunction_SHA256)
-	_, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), wrong)
+	_, err := Open(bytes.NewReader(encoded), int64(len(encoded)), wrong)
 	require.Equal(t, codes.DataLoss, status.Code(err), "same-sized foreign blob must not be accepted")
 	bad := rewriteIndex(t, encoded, func(m map[string]any) { m["function"] = float64(remoteexecution.DigestFunction_SHA1) })
-	_, err = zstdframes.Open(bytes.NewReader(bad), int64(len(bad)), d)
+	_, err = Open(bytes.NewReader(bad), int64(len(bad)), d)
 	require.Equal(t, codes.DataLoss, status.Code(err))
 	footer := encoded[len(encoded)-48:]
 	indexStart := len(encoded) - 48 - int(binary.LittleEndian.Uint64(footer[8:16]))
 	gap := append(append(bytes.Clone(encoded[:indexStart]), 0), encoded[indexStart:]...)
-	_, err = zstdframes.Open(bytes.NewReader(gap), int64(len(gap)), d)
+	_, err = Open(bytes.NewReader(gap), int64(len(gap)), d)
 	require.Equal(t, codes.DataLoss, status.Code(err), "unindexed frame-region bytes must be rejected")
 	bad = rewriteIndex(t, encoded, func(m map[string]any) { m["frames"].([]any)[0].(map[string]any)["hash"] = wrong.GetHashString() })
-	index, err := zstdframes.Open(bytes.NewReader(bad), int64(len(bad)), d)
+	index, err := Open(bytes.NewReader(bad), int64(len(bad)), d)
 	require.NoError(t, err, "well-formed metadata must reach decoded-frame validation")
 	_, _, err = index.ReadFrameAt(t.Context(), 0, false, newPool())
-	require.ErrorIs(t, err, zstdframes.ErrCorruptFrame)
+	require.ErrorIs(t, err, ErrCorruptFrame)
 }
 
 func TestFrameWindowAndProportionalReservation(t *testing.T) {
@@ -513,11 +512,11 @@ func TestFrameWindowAndProportionalReservation(t *testing.T) {
 	for _, size := range []int{0, 1, 4095, 4096, 4097, 1 << 20} {
 		data := bytes.Repeat([]byte("x"), size)
 		encoded, d := encode(t, data, 1<<20, pool)
-		reservation, err := zstdframes.MaximumStoredSize(int64(size), 1<<20)
+		reservation, err := MaximumStoredSize(int64(size), 1<<20)
 		require.NoError(t, err)
 		require.LessOrEqual(t, int64(len(encoded)), reservation)
 		require.Less(t, reservation, int64(size)+int64(size)/8+4096)
-		index, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
+		index, err := Open(bytes.NewReader(encoded), int64(len(encoded)), d)
 		require.NoError(t, err)
 		frame, err := index.ReadCompressedFrame(t.Context(), 0)
 		require.NoError(t, err)
@@ -529,7 +528,7 @@ func TestFrameWindowAndProportionalReservation(t *testing.T) {
 		}
 		require.LessOrEqual(t, header.WindowSize, uint64(max(size, 1024)))
 		var out bytes.Buffer
-		require.NoError(t, index.WriteIdentity(t.Context(), &out, 0, pool))
+		require.NoError(t, index.writeIdentity(t.Context(), &out, 0, pool))
 		require.True(t, bytes.Equal(data, out.Bytes()))
 	}
 }
@@ -539,7 +538,7 @@ func TestFrameEncodingRespectsConfiguredWindow(t *testing.T) {
 	pool := bb_zstd.NewBoundedPool(1, 1, []zstd.EOption{zstd.WithEncoderConcurrency(1), zstd.WithWindowSize(window)}, []zstd.DOption{zstd.WithDecoderConcurrency(1), zstd.WithDecoderMaxWindow(window)})
 	data := bytes.Repeat([]byte("x"), 1<<20)
 	encoded, d := encode(t, data, 1<<20, pool)
-	index, err := zstdframes.Open(bytes.NewReader(encoded), int64(len(encoded)), d)
+	index, err := Open(bytes.NewReader(encoded), int64(len(encoded)), d)
 	require.NoError(t, err)
 	frame, err := index.ReadCompressedFrame(t.Context(), 0)
 	require.NoError(t, err)
@@ -547,6 +546,34 @@ func TestFrameEncodingRespectsConfiguredWindow(t *testing.T) {
 	require.NoError(t, header.Decode(frame))
 	require.LessOrEqual(t, header.WindowSize, uint64(window))
 	var decoded bytes.Buffer
-	require.NoError(t, index.WriteIdentity(t.Context(), &decoded, 0, pool))
+	require.NoError(t, index.writeIdentity(t.Context(), &decoded, 0, pool))
 	require.Equal(t, data, decoded.Bytes())
+}
+
+// frameDigests returns a copy of the ordered logical chunk mapping. The
+// mapping describes fixed-size frames, not a content-defined chunking scheme.
+func (r *Reader) frameDigests() []digest.Digest {
+	digests := make([]digest.Digest, len(r.index.Frames))
+	for i, f := range r.index.Frames {
+		digests[i], _ = r.digest.GetDigestFunction().NewDigest(f.Hash, f.Size)
+	}
+	return digests
+}
+
+// writeIdentity decodes only frames overlapping the requested logical suffix.
+// Codec leases are released before writing to a potentially slow consumer.
+func (r *Reader) writeIdentity(ctx context.Context, dst io.Writer, offset int64, pool bb_zstd.Pool) error {
+	for {
+		data, next, err := r.ReadFrameAt(ctx, offset, false, pool)
+		if err != nil {
+			return err
+		}
+		if len(data) == 0 {
+			return nil
+		}
+		if err := writeAll(dst, data); err != nil {
+			return err
+		}
+		offset = next
+	}
 }

@@ -62,7 +62,7 @@ func TestStalledUploadCannotStarveReadCodecs(t *testing.T) {
 	defer gate.unblock()
 	before := []int64{p.encoders.Load(), p.decoders.Load()}
 	done := make(chan error, 1)
-	source := blobstore.NewMetricsBlobAccess(&encodedSourceStore{source: buffer.NewCASBufferFromZSTDReader(t.Context(), digestOf(incoming), gate, p, buffer.BackendProvided(buffer.Irreparable(digestOf(incoming))))}, clock.SystemClock, "cas", "stalled_encoded_source")
+	source := blobstore.NewMetricsBlobAccess(&encodedSourceStore{source: encodedTestBuffer(t.Context(), digestOf(incoming), gate, p, buffer.BackendProvided(buffer.Irreparable(digestOf(incoming))))}, clock.SystemClock, "cas", "stalled_encoded_source")
 	go func() {
 		done <- store.Put(t.Context(), digestOf(incoming), source.Get(t.Context(), digestOf(incoming)))
 	}()
@@ -109,6 +109,9 @@ func TestStagingContentionWaitsAndCancellationReleasesAdmission(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("upload did not start")
 	}
+	require.Equal(t, float64(reservation), metricValue(t, "buildbarn_cas_compression_staging_reserved_bytes"))
+	require.Equal(t, float64(1), metricValue(t, "buildbarn_cas_compression_active_requests"))
+	waits := metricValue(t, "buildbarn_cas_compression_staging_wait_duration_seconds", "outcome", "canceled")
 	other := bytes.Repeat([]byte("other content"), 1000)
 	otherDigest := digestOf(other)
 	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
@@ -116,6 +119,9 @@ func TestStagingContentionWaitsAndCancellationReleasesAdmission(t *testing.T) {
 	source := &uploadCompletionReader{data: bytes.NewReader(other)}
 	err = store.Put(ctx, otherDigest, buffer.NewCASBufferFromReader(otherDigest, source, buffer.UserProvided))
 	require.Equal(t, codes.DeadlineExceeded, status.Code(err), "contention must wait rather than immediately reject")
+	require.Equal(t, waits+1, metricValue(t, "buildbarn_cas_compression_staging_wait_duration_seconds", "outcome", "canceled"))
+	require.Equal(t, float64(reservation), metricValue(t, "buildbarn_cas_compression_staging_reserved_bytes"))
+	require.Equal(t, float64(1), metricValue(t, "buildbarn_cas_compression_active_requests"))
 	require.Zero(t, source.reads.Load())
 	require.EqualValues(t, 1, source.closes.Load())
 	second := make(chan error, 1)
@@ -233,8 +239,8 @@ func TestEncodedStagingRetryReplacesWholeRepresentation(t *testing.T) {
 				firstReader = io.NopCloser(bytes.NewReader(first))
 			}
 			before := p.decoders.Load()
-			h := &stagingRetryHandler{replacement: buffer.NewCASBufferFromZSTDReader(t.Context(), d, io.NopCloser(bytes.NewReader(replacement)), p, buffer.BackendProvided(buffer.Irreparable(d)))}
-			input := buffer.WithErrorHandler(buffer.NewCASBufferFromZSTDReader(t.Context(), d, firstReader, p, buffer.BackendProvided(buffer.Irreparable(d))), h)
+			h := &stagingRetryHandler{replacement: encodedTestBuffer(t.Context(), d, io.NopCloser(bytes.NewReader(replacement)), p, buffer.BackendProvided(buffer.Irreparable(d)))}
+			input := buffer.WithErrorHandler(encodedTestBuffer(t.Context(), d, firstReader, p, buffer.BackendProvided(buffer.Irreparable(d))), h)
 			require.NoError(t, store.Put(t.Context(), d, input))
 			require.Equal(t, 1, h.calls)
 			require.Equal(t, 1, h.done)
@@ -259,7 +265,7 @@ func TestStagedBackendIntegrityCallbackRetainsSource(t *testing.T) {
 	require.NoError(t, encoder.Close())
 	source := &uploadCompletionReader{data: bytes.NewReader(encoded)}
 	invalid := 0
-	b := buffer.NewCASBufferFromZSTDReader(t.Context(), d, source, p, buffer.BackendProvided(func(valid bool) {
+	b := encodedTestBuffer(t.Context(), d, source, p, buffer.BackendProvided(func(valid bool) {
 		if !valid {
 			invalid++
 			require.Zero(t, source.closes.Load(), "integrity callback must retain its source reference")
@@ -276,7 +282,7 @@ func TestStagedBackendIntegrityCallbackRetainsSource(t *testing.T) {
 
 func TestStreamingDecodeUsesDestinationDeadline(t *testing.T) {
 	p := pool()
-	store, err := blobstore.NewCompressedCASBlobAccess(&repairRecordStore{lookupError: status.Error(codes.Unavailable, "missing")}, t.TempDir(), 1<<20, 1, p)
+	store, err := blobstore.NewCompressedCASBlobAccess(&capturingStore{}, t.TempDir(), 1<<20, 1, p)
 	require.NoError(t, err)
 	data := bytes.Repeat([]byte("local decode deadline"), 1000)
 	d := digestOf(data)
@@ -291,7 +297,7 @@ func TestStreamingDecodeUsesDestinationDeadline(t *testing.T) {
 	defer cancel()
 	done := make(chan error, 1)
 	// The source may have a longer lifetime than this destination upload.
-	source := buffer.NewCASBufferFromZSTDReader(t.Context(), d, io.NopCloser(bytes.NewReader(encoded)), p, buffer.BackendProvided(buffer.Irreparable(d)))
+	source := encodedTestBuffer(t.Context(), d, io.NopCloser(bytes.NewReader(encoded)), p, buffer.BackendProvided(buffer.Irreparable(d)))
 	go func() { done <- store.Put(ctx, d, source) }()
 	select {
 	case err := <-done:
@@ -343,9 +349,12 @@ func TestDuplicateUploadsShareTheBoundedRequestQueue(t *testing.T) {
 			t.Fatal("duplicate did not begin draining")
 		}
 	}
+	rejected := metricValue(t, "buildbarn_cas_compression_rejected_requests_total", "reason", "request_queue")
+	require.Equal(t, float64(4), metricValue(t, "buildbarn_cas_compression_active_requests"))
 	overflow := &uploadCompletionReader{}
 	err := store.Put(t.Context(), d, buffer.NewCASBufferFromZSTDUpload(t.Context(), d, overflow, p))
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+	require.Equal(t, rejected+1, metricValue(t, "buildbarn_cas_compression_rejected_requests_total", "reason", "request_queue"))
 	require.Zero(t, overflow.reads.Load())
 	require.EqualValues(t, 1, overflow.closes.Load())
 	for _, gate := range gates {
@@ -360,7 +369,7 @@ func TestDuplicateUploadsShareTheBoundedRequestQueue(t *testing.T) {
 
 func TestStreamingUploadEncodesBeforeInputCompletes(t *testing.T) {
 	p := pool()
-	base := &repairRecordStore{lookupError: status.Error(codes.Unavailable, "missing")}
+	base := &capturingStore{}
 	dir := t.TempDir()
 	data := bytes.Repeat([]byte("s"), 2<<20)
 	d := digestOf(data)
@@ -387,7 +396,9 @@ func TestStreamingUploadEncodesBeforeInputCompletes(t *testing.T) {
 	r, err := zstdframes.Open(bytes.NewReader(base.record), int64(len(base.record)), d)
 	require.NoError(t, err)
 	var actual bytes.Buffer
-	require.NoError(t, r.WriteIdentity(t.Context(), &actual, 0, p))
+	decoded, err := buffer.NewCASBufferFromZSTDRepresentation(d, &countedRecordReader{Reader: bytes.NewReader(base.record)}, int64(len(base.record)), r, p, buffer.BackendProvided(func(bool) {})).ToByteSlice(len(data))
+	require.NoError(t, err)
+	actual.Write(decoded)
 	require.Equal(t, data, actual.Bytes())
 	entries, err := os.ReadDir(dir)
 	require.NoError(t, err)
@@ -427,7 +438,7 @@ func TestStreamingFallbackCanRepairThroughSameStore(t *testing.T) {
 	ctx, cancel := context.WithTimeout(t.Context(), 2*time.Second)
 	defer cancel()
 	h := &repairFallbackHandler{ctx: ctx, d: d, replicator: replication.NewLocalBlobReplicator(repairSource{data: data}, store)}
-	bad := buffer.NewCASBufferFromZSTDReader(ctx, d, io.NopCloser(bytes.NewReader([]byte("malformed"))), p, buffer.BackendProvided(buffer.Irreparable(d)))
+	bad := encodedTestBuffer(ctx, d, io.NopCloser(bytes.NewReader([]byte("malformed"))), p, buffer.BackendProvided(buffer.Irreparable(d)))
 	require.NoError(t, store.Put(ctx, d, buffer.WithErrorHandler(bad, h)))
 	require.Equal(t, 1, h.calls)
 	actual, err := store.Get(ctx, d).ToByteSlice(len(data))

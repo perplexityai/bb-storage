@@ -281,7 +281,7 @@ func TestTinyRawAndCorruptStorage(t *testing.T) {
 	var results []bool
 	callback := func(valid bool) { results = append(results, valid) }
 	b := factory.NewBufferFromByteSlice(d, data, callback)
-	_, encoded := buffer.ZSTDChunkReader(b, 4096)
+	_, encoded := buffer.ZSTDChunkReaderAt(b, 0, 4096)
 	require.False(t, encoded)
 	actual, err := b.ToByteSlice(len(data))
 	require.NoError(t, err)
@@ -294,7 +294,7 @@ func TestTinyRawAndCorruptStorage(t *testing.T) {
 		corrupted[offset] ^= 0x80
 		results = nil
 		b := factory.NewBufferFromByteSlice(d, corrupted, callback)
-		if r, ok := buffer.ZSTDChunkReader(b, 4096); ok {
+		if r, ok := buffer.ZSTDChunkReaderAt(b, 0, 4096); ok {
 			_, err = r.Read()
 			r.Close()
 		} else {
@@ -410,7 +410,7 @@ func (h *replacementHandler) OnError(err error) (buffer.Buffer, error) {
 	if err != nil {
 		return nil, err
 	}
-	return buffer.NewCASBufferFromZSTDReader(h.ctx, h.d, io.NopCloser(bytes.NewReader(h.owner.encoded)), h.owner.pool, buffer.BackendProvided(buffer.Irreparable(h.d))), nil
+	return encodedTestBuffer(h.ctx, h.d, io.NopCloser(bytes.NewReader(h.owner.encoded)), h.owner.pool, buffer.BackendProvided(buffer.Irreparable(h.d))), nil
 }
 func (h *replacementHandler) Done() { h.owner.done.Add(1) }
 
@@ -461,7 +461,7 @@ func TestCompressedReadPreservesStorageErrors(t *testing.T) {
 			backing := &frameReadFailure{Reader: bytes.NewReader(encoded.Bytes()), err: failure}
 			var valid bool
 			b := blobstore.NewCompressedCASReadBufferFactory(p).NewBufferFromReaderAt(d, backing, int64(encoded.Len()), func(v bool) { valid = v })
-			r, ok := buffer.ZSTDChunkReader(b, 4096)
+			r, ok := buffer.ZSTDChunkReaderAt(b, 0, 4096)
 			require.True(t, ok)
 			_, err := r.Read()
 			r.Close()
@@ -486,7 +486,7 @@ func TestTruncatedCompressedSourceFailsLogicalReads(t *testing.T) {
 	p := pool()
 	for _, cut := range []int{1, 3, 10, len(encoded) / 2} {
 		t.Run(fmt.Sprint(cut), func(t *testing.T) {
-			b := buffer.NewCASBufferFromZSTDReader(t.Context(), d, io.NopCloser(bytes.NewReader(encoded[:len(encoded)-cut])), p, buffer.BackendProvided(buffer.Irreparable(d)))
+			b := encodedTestBuffer(t.Context(), d, io.NopCloser(bytes.NewReader(encoded[:len(encoded)-cut])), p, buffer.BackendProvided(buffer.Irreparable(d)))
 			r := b.ToChunkReader(0, 64)
 			var err error
 			for err == nil {
@@ -521,8 +521,8 @@ func TestEncodedReadPreservesFullChunkTerminalStatus(t *testing.T) {
 			p := pool()
 			data := []byte("payload")
 			source := &terminalBytesReader{data: data, err: terminal}
-			b := buffer.NewCASBufferFromZSTDReader(t.Context(), digestOf(data), source, p, buffer.BackendProvided(buffer.Irreparable(digestOf(data))))
-			r, ok := buffer.ZSTDChunkReader(b, len(data))
+			b := encodedTestBuffer(t.Context(), digestOf(data), source, p, buffer.BackendProvided(buffer.Irreparable(digestOf(data))))
+			r, ok := buffer.ZSTDChunkReaderAt(b, 0, len(data))
 			require.True(t, ok)
 			defer r.Close()
 			chunk, err := r.Read()
@@ -573,4 +573,29 @@ func TestReadFallbackReleasesFailedDecoderBeforeReplication(t *testing.T) {
 			require.Equal(t, data, copied)
 		})
 	}
+}
+
+// A lazy test backend owns its already-created stream until opened or discarded.
+type encodedFixtureOwner struct {
+	r      io.ReadCloser
+	opened atomic.Bool
+}
+
+func (*encodedFixtureOwner) NonRetrying()                             {}
+func (*encodedFixtureOwner) OnError(err error) (buffer.Buffer, error) { return nil, err }
+func (h *encodedFixtureOwner) Done() {
+	if !h.opened.Load() {
+		h.r.Close()
+	}
+}
+
+func encodedTestBuffer(ctx context.Context, d digest.Digest, r io.ReadCloser, p bb_zstd.Pool, source buffer.Source) buffer.Buffer {
+	owner := &encodedFixtureOwner{r: r}
+	return buffer.WithErrorHandler(buffer.NewCASBufferFromZSTDReadFactory(ctx, d, func(offset int64) (io.ReadCloser, error) {
+		if offset != 0 {
+			return nil, status.Error(codes.InvalidArgument, "fixture supports whole streams only")
+		}
+		owner.opened.Store(true)
+		return r, nil
+	}, p, source), owner)
 }

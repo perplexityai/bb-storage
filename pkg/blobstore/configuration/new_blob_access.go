@@ -14,6 +14,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore/readfallback"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/replication"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/sharding"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
 	"github.com/buildbarn/bb-storage/pkg/blockdevice"
 	"github.com/buildbarn/bb-storage/pkg/clock"
 	"github.com/buildbarn/bb-storage/pkg/digest"
@@ -157,6 +158,9 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			if !ok || backend.Local.GetBlocksOnBlockDevice() == nil {
 				return BlobAccessInfo{}, "", status.Error(codes.InvalidArgument, "CAS compression requires block-device CAS storage")
 			}
+			if backend.Local.GetBlocksOnBlockDevice().DataIntegrityValidationCache != nil {
+				return BlobAccessInfo{}, "", status.Error(codes.InvalidArgument, "CAS compression requires data_integrity_validation_cache to be unset")
+			}
 			compressionPool = casCreator.zstdPool
 			var err error
 			uploadPool, err = bb_zstd.NewUploadPoolFromConfiguration(compression.UploadZstdPool, compression.MaximumConcurrentWrites)
@@ -166,7 +170,7 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			if err := blobstore.ValidateCompressedCASConfiguration(compression.StagingDirectory, compression.MaximumStagedBytes, compression.MaximumConcurrentWrites, compressionPool); err != nil {
 				return BlobAccessInfo{}, "", err
 			}
-			if err := bb_zstd.ValidatePoolCompatibility(uploadPool, compressionPool, 1<<20); err != nil {
+			if err := bb_zstd.ValidatePoolCompatibility(uploadPool, compressionPool, zstdframes.DefaultFrameSize); err != nil {
 				return BlobAccessInfo{}, "", err
 			}
 		}
@@ -182,7 +186,7 @@ func (nc *simpleNestedBlobAccessCreator) newNestedBlobAccessBare(configuration *
 			var err error
 			persistentStateDirectory, err = filesystem.NewLocalDirectory(path.LocalFormat.NewParser(persistent.StateDirectoryPath))
 			if err != nil {
-				return BlobAccessInfo{}, "", util.StatusWrapWithCode(err, codes.Internal, "Failed to open persistent state directory")
+				return BlobAccessInfo{}, "", util.StatusWrapWithCode(err, codes.Internal, "Failed to open persistent state directory "+persistent.StateDirectoryPath)
 			}
 			defer func() {
 				if !keepStateDirectory {

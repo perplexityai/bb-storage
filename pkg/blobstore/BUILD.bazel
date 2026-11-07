@@ -33,6 +33,7 @@ go_library(
     deps = [
         "//pkg/auth",
         "//pkg/blobstore/buffer",
+        "//pkg/blobstore/compressionmetrics",
         "//pkg/blobstore/slicing",
         "//pkg/blobstore/zstdframes",
         "//pkg/capabilities",
@@ -107,6 +108,7 @@ go_test(
     srcs = ["compressed_admission_test.go"],
     embed = [":blobstore"],
     deps = [
+        "@com_github_prometheus_client_golang//prometheus",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",

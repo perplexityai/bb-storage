@@ -51,6 +51,7 @@ go_test(
     name = "buffer_test",
     srcs = [
         "cas_buffer_with_background_task_test.go",
+        "compressed_stream_test.go",
         "error_handler_test.go",
         "example_test.go",
         "new_buffer_from_error_test.go",
@@ -68,7 +69,9 @@ go_test(
         "//internal/mock",
         "//pkg/digest",
         "//pkg/testutil",
+        "//pkg/zstd",
         "@bazel_remote_apis//build/bazel/remote/execution/v2:remote_execution_go_proto",
+        "@com_github_klauspost_compress//zstd",
         "@com_github_stretchr_testify//require",
         "@org_golang_google_grpc//codes",
         "@org_golang_google_grpc//status",

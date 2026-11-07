@@ -15,13 +15,6 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-// ZSTDChunkReader consumes a buffer's encoded representation when available.
-// False leaves the buffer untouched. Encoded forwarding trusts the backend's
-// logical validation; clients must still validate their logical digest.
-func ZSTDChunkReader(b Buffer, maximumChunkSizeBytes int) (ChunkReader, bool) {
-	return ZSTDChunkReaderAt(b, 0, maximumChunkSizeBytes)
-}
-
 // ZSTDChunkReaderAt reads a compressed suffix using logical byte offsets.
 // Retrying decorators fall back to logical reads so replacements never resume
 // an encoded stream at an offset belonging to a different representation.
@@ -112,13 +105,6 @@ type compressedBuffer struct {
 	stored      *storedRepresentation
 	upload      bool
 	readEncoded func(int64) (io.ReadCloser, error)
-}
-
-// NewCASBufferFromZSTDReader preserves encoded bytes from a trusted backend.
-// Logical consumers acquire a decoder and validate size and digest normally.
-// This constructor must not be used to bypass validation of user uploads.
-func NewCASBufferFromZSTDReader(ctx context.Context, d digest.Digest, r io.ReadCloser, pool zstd.Pool, source Source) Buffer {
-	return &compressedBuffer{ctx: ctx, digest: d, encoded: r, pool: pool, source: source}
 }
 
 // NewCASBufferFromZSTDReadFactory defers a trusted backend read until its

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/compressionmetrics"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/slicing"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
 	"github.com/buildbarn/bb-storage/pkg/digest"
@@ -20,7 +21,7 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-const storedFrameSize = 1 << 20
+const tinyRecordSize = 4 << 10
 
 type compressedCASBlobAccess struct {
 	BlobAccess
@@ -46,7 +47,7 @@ func NewCompressedCASBlobAccess(base BlobAccess, directory string, maximumStaged
 // ValidateCompressedCASConfiguration checks staging requirements before a
 // configuration builder opens or truncates the storage device.
 func ValidateCompressedCASConfiguration(directory string, maximumStagedBytes, maximumWrites int64, pool zstd.Pool) error {
-	minimum, _ := zstdframes.MaximumStoredSize(0, storedFrameSize)
+	minimum, _ := zstdframes.MaximumStoredSize(0, zstdframes.DefaultFrameSize)
 	if directory == "" || maximumStagedBytes < minimum || maximumWrites <= 0 || maximumWrites > math.MaxInt64/4 || pool == nil {
 		return status.Errorf(codes.InvalidArgument, "Compressed storage requires a staging directory, at least %d staging bytes, a positive write budget, and a codec pool", minimum)
 	}
@@ -70,87 +71,41 @@ func (ba *compressedCASBlobAccess) GetFromComposite(ctx context.Context, parent,
 	return b
 }
 
-// Presence requires readable metadata: otherwise clients that check before
-// uploading can never repair unsupported records. Get also refreshes old blocks.
-func (ba *compressedCASBlobAccess) FindMissing(ctx context.Context, digests digest.Set) (digest.Set, error) {
-	missing := digest.NewSetBuilder(digests.Length())
-	for _, d := range digests.Items() {
-		if err := ctx.Err(); err != nil {
-			return digest.EmptySet, status.FromContextError(err).Err()
-		}
-		err := ba.probeRecord(ctx, d)
-		switch status.Code(err) {
-		case codes.OK:
-		case codes.NotFound, codes.FailedPrecondition, codes.DataLoss:
-			missing.Add(d)
-		default:
-			return digest.EmptySet, err
-		}
-	}
-	return missing.Build(), nil
-}
-
-func (ba *compressedCASBlobAccess) probeRecord(ctx context.Context, d digest.Digest) error {
-	r := buffer.NewReaderFromChunkReader(ba.Get(ctx, d).ToChunkReader(d.GetSizeBytes(), 1))
-	var probe [1]byte
-	_, err := r.Read(probe[:])
-	if closeErr := r.Close(); closeErr != nil && (err == nil || err == io.EOF) {
-		err = closeErr
-	}
-	if err == io.EOF {
-		return nil
-	}
-	return err
-}
-
 func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b buffer.Buffer) error {
 	if err := ctx.Err(); err != nil {
 		b.Discard()
 		return status.FromContextError(err).Err()
 	}
 	if !ba.requests.TryAcquire(1) {
+		compressionmetrics.Reject("request_queue")
 		b.Discard()
 		return status.Error(codes.ResourceExhausted, "Compressed upload queue is full")
 	}
 	defer ba.requests.Release(1)
+	compressionmetrics.RequestStarted()
+	defer compressionmetrics.RequestFinished()
 	// This runs inside Put, after any upload authorization. Checking in the
 	// protocol handler via FindMissing would instead apply read-side policy.
 	missing, err := ba.BlobAccess.FindMissing(ctx, d.ToSingletonSet())
-	if err != nil && status.Code(err) != codes.Unavailable && status.Code(err) != codes.Internal && status.Code(err) != codes.DataLoss && status.Code(err) != codes.Unknown && status.Code(err) != codes.FailedPrecondition {
+	if err != nil {
 		b.Discard()
 		return err
 	}
-	repair := err != nil
-	if err == nil && missing.Empty() {
-		// Opening the logical end validates the index without decoding the
-		// payload. Presence alone cannot identify unsupported or unreadable
-		// records, and must not suppress an authorized repair upload.
-		readErr := ba.probeRecord(ctx, d)
-		if readErr == nil || readErr == io.EOF {
-			return buffer.SkipUpload(b)
+	if missing.Empty() {
+		err := buffer.SkipUpload(b)
+		if err == nil {
+			compressionmetrics.Put("duplicate", d.GetSizeBytes(), 0)
 		}
-		switch status.Code(readErr) {
-		case codes.Canceled, codes.DeadlineExceeded, codes.PermissionDenied, codes.Unauthenticated, codes.ResourceExhausted:
-			b.Discard()
-			return readErr
-		}
-		repair = true
-	}
-	put := ba.BlobAccess.Put
-	if repair {
-		if local, ok := ba.BlobAccess.(interface {
-			PutRepair(context.Context, digest.Digest, buffer.Buffer) error
-		}); ok {
-			put = local.PutRepair
-		}
+		return err
 	}
 
-	reservation, err := zstdframes.MaximumStoredSize(d.GetSizeBytes(), storedFrameSize)
+	reservation, err := zstdframes.MaximumStoredSize(d.GetSizeBytes(), zstdframes.DefaultFrameSize)
 	if err != nil {
 		b.Discard()
 		return err
 	}
 	if reservation > ba.maximumStagedBytes {
+		compressionmetrics.Reject("staging_budget")
 		b.Discard()
 		return status.Error(codes.InvalidArgument, "Blob cannot fit the configured staging budget")
 	}
@@ -159,6 +114,8 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 		return err
 	}
 	defer ba.bytes.Release(reservation)
+	compressionmetrics.Reserve(reservation)
+	defer compressionmetrics.Release(reservation)
 	f, err := ba.createStagingFile()
 	if err != nil {
 		b.Discard()
@@ -181,7 +138,7 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 			return &buffer.UploadDestinationError{Err: stagingError(err)}
 		}
 		w := &stagingWriter{file: f, remaining: reservation}
-		if err := zstdframes.Encode(ctx, w, d, r, storedFrameSize, ba.pool); err != nil {
+		if err := zstdframes.Encode(ctx, w, d, r, zstdframes.DefaultFrameSize, ba.pool); err != nil {
 			var encoding *zstdframes.EncodingError
 			if errors.As(err, &encoding) {
 				return &buffer.UploadDestinationError{Err: encoding.Err}
@@ -199,7 +156,7 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 	if err := ctx.Err(); err != nil {
 		return status.FromContextError(err).Err()
 	}
-	if d.GetSizeBytes() <= 4096 && physicalSize >= d.GetSizeBytes() {
+	if d.GetSizeBytes() <= tinyRecordSize && physicalSize >= d.GetSizeBytes() {
 		// Tiny records do not justify an index. Larger incompressible records
 		// retain frame checksums so indexed random reads remain efficient.
 		// Decode staging directly into the raw allocation without another file.
@@ -209,9 +166,17 @@ func (ba *compressedCASBlobAccess) Put(ctx context.Context, d digest.Digest, b b
 			return err
 		}
 		logical := buffer.NewCASBufferFromZSTDRepresentation(d, reader, physicalSize, index, ba.pool, buffer.BackendProvided(func(bool) {}))
-		return put(ctx, d, buffer.WithZSTDContext(logical, ctx))
+		err = ba.BlobAccess.Put(ctx, d, buffer.WithZSTDContext(logical, ctx))
+		if err == nil {
+			compressionmetrics.Put("tiny_raw", d.GetSizeBytes(), d.GetSizeBytes())
+		}
+		return err
 	}
-	return put(ctx, d, buffer.NewValidatedBufferFromReaderAt(&stagingReader{ctx: ctx, File: f}, physicalSize))
+	err = ba.BlobAccess.Put(ctx, d, buffer.NewValidatedBufferFromReaderAt(&stagingReader{ctx: ctx, File: f}, physicalSize))
+	if err == nil {
+		compressionmetrics.Put("indexed", d.GetSizeBytes(), physicalSize)
+	}
+	return err
 }
 
 // A fitting upload may pass a larger waiter. The request semaphore bounds the
@@ -253,12 +218,18 @@ func (b *stagingBudget) Release(amount int64) {
 }
 
 func acquireUploadCapacity(ctx context.Context, capacity *stagingBudget, amount int64) error {
+	start := time.Now()
+	outcome := "admitted"
+	defer func() { compressionmetrics.StagingWait(start, outcome) }()
 	waitCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
 	if err := capacity.Acquire(waitCtx, amount); err != nil {
 		if ctx.Err() != nil {
+			outcome = "canceled"
 			return status.FromContextError(ctx.Err()).Err()
 		}
+		outcome = "timeout"
+		compressionmetrics.Reject("staging_timeout")
 		return status.Error(codes.ResourceExhausted, "Timed out waiting for compressed upload capacity")
 	}
 	return nil
@@ -316,25 +287,24 @@ func (r *stagingReader) ReadAt(p []byte, off int64) (int, error) {
 }
 
 type compressedCASReadBufferFactory struct {
-	pool    zstd.Pool
-	indexes *zstdframes.IndexCache
+	pool zstd.Pool
 }
 
 // NewCompressedCASReadBufferFactory reads indexed compressed CAS and tiny raw
 // records. Encoded checksums always remain enabled, including during refresh.
 // This factory is intended for random-access local block storage.
 func NewCompressedCASReadBufferFactory(pool zstd.Pool) ReadBufferFactory {
-	return &compressedCASReadBufferFactory{pool: pool, indexes: zstdframes.NewIndexCache(64 << 20)}
+	return &compressedCASReadBufferFactory{pool: pool}
 }
 
 func (f *compressedCASReadBufferFactory) NewBufferFromReaderAt(d digest.Digest, r buffer.ReadAtCloser, size int64, callback buffer.DataIntegrityCallback) buffer.Buffer {
 	return buffer.NewCASBufferFromDeferredReaderAt(d, r, buffer.BackendProvided(callback), func(r buffer.ReadAtCloser) buffer.Buffer {
 		// Raw records are produced only by the tiny-record optimization. Full
 		// validation is bounded to 4 KiB; larger unindexed records are rejected.
-		if size == d.GetSizeBytes() && size <= 4096 {
+		if size == d.GetSizeBytes() && size <= tinyRecordSize {
 			return CASReadBufferFactory.NewBufferFromReaderAt(d, r, size, callback)
 		}
-		index, err := f.indexes.Open(r, size, d)
+		index, err := zstdframes.Open(r, size, d)
 		if err == nil {
 			return buffer.NewCASBufferFromZSTDRepresentation(d, r, size, index, f.pool, buffer.BackendProvided(callback))
 		}

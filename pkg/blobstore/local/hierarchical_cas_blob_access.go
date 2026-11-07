@@ -127,10 +127,6 @@ func (ba *hierarchicalCASBlobAccess) finalizePut(putFinalizer LocationBlobPutFin
 		return err
 	}
 
-	return ba.recordPut(location, canonicalKey, lookupKey)
-}
-
-func (ba *hierarchicalCASBlobAccess) recordPut(location Location, canonicalKey, lookupKey Key) error {
 	// Store two key-location map entries: one for the canonical key
 	// and one for the lookup key.
 	if err := ba.keyLocationMap.Put(canonicalKey, location, ba.blockReferenceResolver); err != nil {
@@ -228,17 +224,6 @@ func (ba *hierarchicalCASBlobAccess) GetFromComposite(ctx context.Context, paren
 }
 
 func (ba *hierarchicalCASBlobAccess) Put(ctx context.Context, blobDigest digest.Digest, b buffer.Buffer) error {
-	return ba.put(ctx, blobDigest, b, false)
-}
-
-// PutRepair replaces an unreadable canonical record without invalidating its
-// block, which may also contain unrelated readable records. The caller must
-// validate the replacement before supplying a physical representation.
-func (ba *hierarchicalCASBlobAccess) PutRepair(ctx context.Context, blobDigest digest.Digest, b buffer.Buffer) error {
-	return ba.put(ctx, blobDigest, b, true)
-}
-
-func (ba *hierarchicalCASBlobAccess) put(ctx context.Context, blobDigest digest.Digest, b buffer.Buffer, repair bool) error {
 	sizeBytes, err := b.GetSizeBytes()
 	if err != nil {
 		b.Discard()
@@ -252,7 +237,7 @@ func (ba *hierarchicalCASBlobAccess) put(ctx context.Context, blobDigest digest.
 	lookupKey := getMostSpecificLookupKey(blobDigest)
 	ba.lock.Lock()
 	if location, err := ba.keyLocationMap.Get(canonicalKey, ba.blockReferenceResolver); err == nil {
-		if _, needsRefresh := ba.locationBlobMap.Get(location); !needsRefresh && !repair {
+		if _, needsRefresh := ba.locationBlobMap.Get(location); !needsRefresh {
 			ba.lock.Unlock()
 
 			// Do make sure that the caller actually
@@ -304,26 +289,6 @@ func (ba *hierarchicalCASBlobAccess) put(ctx context.Context, blobDigest digest.
 	// the instance name and once without.
 	ba.lock.Lock()
 	defer ba.lock.Unlock()
-	if repair {
-		location, err := putFinalizer()
-		if err != nil {
-			return err
-		}
-		// An inherited lookup precedes the child's entry during Get. Repair
-		// that existing grant, but never create a new parent grant if it
-		// disappeared while the replacement was being written.
-		inheritedKey, _, err := ba.getLeastSpecificLookupEntry(getAllLookupKeys(blobDigest))
-		if err != nil && status.Code(err) != codes.NotFound {
-			return err
-		}
-		if writeErr := ba.recordPut(location, canonicalKey, lookupKey); writeErr != nil {
-			return writeErr
-		}
-		if err == nil && inheritedKey != lookupKey {
-			return ba.keyLocationMap.Put(inheritedKey, location, ba.blockReferenceResolver)
-		}
-		return nil
-	}
 	return ba.finalizePut(putFinalizer, canonicalKey, lookupKey)
 }
 

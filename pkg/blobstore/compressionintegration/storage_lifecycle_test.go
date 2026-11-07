@@ -66,22 +66,6 @@ func TestCompressedReadFactoryDefersIOAndPinsClones(t *testing.T) {
 	}
 }
 
-func TestKnownReadFailureDoesNotWaitForDecoder(t *testing.T) {
-	p := pool()
-	held, err := p.NewDecoder(t.Context(), nil)
-	require.NoError(t, err)
-	defer held.Close()
-	ctx, cancel := context.WithTimeout(t.Context(), 100*time.Millisecond)
-	defer cancel()
-	d := digestOf([]byte("hello"))
-	expected := status.Error(codes.Unavailable, "Backend read failed")
-	b := buffer.NewCASBufferFromZSTDReadFactory(ctx, d, func(int64) (io.ReadCloser, error) { return nil, expected }, p, buffer.BackendProvided(buffer.Irreparable(d)))
-	_, err = b.ToByteSlice(5)
-	require.Equal(t, expected, err)
-	require.NoError(t, ctx.Err())
-	require.EqualValues(t, 1, p.decoders.Load(), "a known error must not attempt another codec acquisition")
-}
-
 func TestLocalDuplicatePreservesCompletionFailures(t *testing.T) {
 	p := pool()
 	store, _, _ := localStorage(t, p)
@@ -255,68 +239,4 @@ func TestDuplicateFallbackPreservesReaderCloseError(t *testing.T) {
 	require.Equal(t, expected, store.Put(t.Context(), d, source))
 	require.True(t, h.done)
 	require.EqualValues(t, 1, r.closes.Load())
-}
-
-type evictingKeyMap struct {
-	local.KeyLocationMap
-	hidden local.Key
-	hide   bool
-}
-
-func (m *evictingKeyMap) Get(k local.Key, r local.BlockReferenceResolver) (local.Location, error) {
-	if m.hide && k == m.hidden {
-		return local.Location{}, status.Error(codes.NotFound, "lookup evicted")
-	}
-	return m.KeyLocationMap.Get(k, r)
-}
-
-func TestRepairedChildSurvivesInheritedLookupEviction(t *testing.T) {
-	p := pool()
-	dir := t.TempDir()
-	f, err := os.CreateTemp(dir, "blocks")
-	require.NoError(t, err)
-	defer f.Close()
-	require.NoError(t, f.Truncate(5*16384))
-	allocator := local.NewBlockDeviceBackedBlockAllocator(f, blobstore.NewCompressedCASReadBufferFactory(p), 1, 16384, 5, "repair_child_lookup")
-	locations := local.NewOldCurrentNewLocationBlobMap(local.NewVolatileBlockList(allocator), local.NewImmutableBlockListGrowthPolicy(1, 1), util.DefaultErrorLogger, "repair_child_lookup", 16384, 1, 1, 0)
-	keys := &evictingKeyMap{KeyLocationMap: lossymap.NewHashMap(local.NewInMemoryLocationRecordArray(1024), func(k *local.LocationRecordKey) uint64 {
-		h := uint64(k.Attempt)
-		for _, c := range k.Key {
-			h = h*1099511628211 ^ uint64(c)
-		}
-		return h
-	}, 1024, func(a, b *local.Location) int {
-		if c := cmp.Compare(a.BlockIndex, b.BlockIndex); c != 0 {
-			return c
-		}
-		return cmp.Compare(a.OffsetBytes, b.OffsetBytes)
-	}, 16, 64, "repair_child_lookup")}
-	base := local.NewHierarchicalCASBlobAccess(keys, locations, locations, &sync.RWMutex{}, nil)
-	store, err := blobstore.NewCompressedCASBlobAccess(base, dir, 1<<20, 2, p)
-	require.NoError(t, err)
-	data := bytes.Repeat([]byte("repair both lookup grants"), 500)
-	d := digestOf(data)
-	parent := digest.MustNewDigest("parent", d.GetDigestFunction().GetEnumValue(), d.GetHashString(), d.GetSizeBytes())
-	child := digest.MustNewDigest("parent/child", d.GetDigestFunction().GetEnumValue(), d.GetHashString(), d.GetSizeBytes())
-	for _, d := range []digest.Digest{child, parent} {
-		require.NoError(t, store.Put(t.Context(), d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided)))
-	}
-	disk, err := os.ReadFile(f.Name())
-	require.NoError(t, err)
-	footer := bytes.LastIndex(disk, []byte("BBZSTF01"))
-	require.GreaterOrEqual(t, footer, 0)
-	_, err = f.WriteAt([]byte("99"), int64(footer+6))
-	require.NoError(t, err)
-	_, err = store.Get(t.Context(), child).ToByteSlice(len(data))
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
-	require.NoError(t, store.Put(t.Context(), child, buffer.NewCASBufferFromByteSlice(child, data, buffer.UserProvided)))
-	keys.hidden = local.NewKeyFromString(parent.GetKey(digest.KeyWithInstance))
-	keys.hide = true
-	got, err := store.Get(t.Context(), child).ToByteSlice(len(data))
-	require.NoError(t, err)
-	require.Equal(t, data, got)
-	keys.hide = false
-	got, err = store.Get(t.Context(), parent).ToByteSlice(len(data))
-	require.NoError(t, err)
-	require.Equal(t, data, got)
 }

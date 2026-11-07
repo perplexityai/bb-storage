@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"testing"
 	"time"
 
@@ -15,6 +16,7 @@ import (
 	"github.com/buildbarn/bb-storage/pkg/blobstore/zstdframes"
 	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 	"github.com/google/uuid"
+	"github.com/klauspost/compress/zstd"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/genproto/googleapis/bytestream"
 	"google.golang.org/grpc/codes"
@@ -179,8 +181,58 @@ func TestAnnotatedCompressedReaderPreservesCompletionFailure(t *testing.T) {
 	expected := status.Error(codes.Unavailable, "Background completion failed")
 	handler := &completionAnnotationHandler{}
 	source := buffer.WithErrorHandler(store.Get(t.Context(), d).WithTask(func() error { return expected }), handler)
-	chunks, ok := buffer.ZSTDChunkReader(source, 4096)
+	chunks, ok := buffer.ZSTDChunkReaderAt(source, 0, 4096)
 	require.True(t, ok)
 	require.Equal(t, expected, buffer.NewReaderFromChunkReader(chunks).Close())
 	require.True(t, handler.done)
+}
+
+// Legacy clients returned Send's EOF without first obtaining the successful
+// response. Preserve that behavior in the compatibility fixture, rather than
+// testing only the current client's explicit early-completion support.
+type legacyUploadWriter struct {
+	stream bytestream.ByteStream_WriteClient
+	name   string
+	offset int64
+}
+
+func (w *legacyUploadWriter) Write(p []byte) (int, error) {
+	if err := w.stream.Send(&bytestream.WriteRequest{ResourceName: w.name, WriteOffset: w.offset, Data: p}); err != nil {
+		return 0, err
+	}
+	w.offset += int64(len(p))
+	w.name = ""
+	return len(p), nil
+}
+
+func TestLegacyCompressedClientDuplicateCompatibility(t *testing.T) {
+	p := pool()
+	store, _, _ := localStorageSized(t, p, true, false, 5*(8<<20))
+	conn := serve(t, store, p)
+	random := rand.New(rand.NewPCG(19, 21))
+	for _, size := range []int{1 << 20, 4 << 20} {
+		data := make([]byte, size)
+		for i := range data {
+			data[i] = byte(random.Uint32())
+		}
+		d := digestOf(data)
+		require.NoError(t, store.Put(t.Context(), d, buffer.NewCASBufferFromByteSlice(d, data, buffer.UserProvided)))
+		before := []int64{p.encoders.Load(), p.decoders.Load()}
+		ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+		stream, err := bytestream.NewByteStreamClient(conn).Write(ctx)
+		require.NoError(t, err)
+		w := &legacyUploadWriter{stream: stream, name: d.GetByteStreamWritePath(uuid.New(), remoteexecution.Compressor_ZSTD)}
+		encoder, err := zstd.NewWriter(w, zstd.WithEncoderConcurrency(1))
+		require.NoError(t, err)
+		_, copyErr := io.Copy(encoder, bytes.NewReader(data))
+		closeErr := encoder.Close()
+		require.NoError(t, copyErr)
+		require.NoError(t, closeErr)
+		require.NoError(t, stream.Send(&bytestream.WriteRequest{WriteOffset: w.offset, FinishWrite: true}))
+		response, err := stream.CloseAndRecv()
+		require.NoError(t, err)
+		require.Equal(t, w.offset, response.CommittedSize)
+		require.Equal(t, before, []int64{p.encoders.Load(), p.decoders.Load()}, "duplicates drain bytes without codecs")
+		cancel()
+	}
 }

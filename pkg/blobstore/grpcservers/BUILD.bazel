@@ -18,6 +18,7 @@ go_library(
     deps = [
         "//pkg/blobstore",
         "//pkg/blobstore/buffer",
+        "//pkg/blobstore/compressionmetrics",
         "//pkg/digest",
         "//pkg/proto/fsac",
         "//pkg/proto/icas",

@@ -13,12 +13,16 @@ import (
 	"io"
 
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/compressionmetrics"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	"github.com/buildbarn/bb-storage/pkg/zstd"
 
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// DefaultFrameSize is the logical frame size used by compressed local CAS.
+const DefaultFrameSize = 1 << 20
 
 const (
 	minimumFrameSize = 4 << 10
@@ -295,7 +299,16 @@ func Encode(ctx context.Context, dst io.Writer, d digest.Digest, src io.Reader, 
 // digest. Frame checksums are checked before their bytes are returned. This
 // detects storage corruption; it is not authentication of untrusted uploads.
 // Only representations produced by Encode may be published in this store.
-func Open(source io.ReaderAt, size int64, expected digest.Digest) (*Reader, error) {
+func Open(source io.ReaderAt, size int64, expected digest.Digest) (result *Reader, err error) {
+	defer func() {
+		switch err {
+		case ErrInvalidRepresentation:
+			compressionmetrics.Integrity("invalid_index")
+		case ErrUnsupportedVersion:
+			compressionmetrics.Integrity("unsupported_version")
+		}
+	}()
+
 	if expected == digest.BadDigest || size < footerSize {
 		return nil, ErrInvalidRepresentation
 	}
@@ -374,16 +387,6 @@ func (r *Reader) WriteRepresentation(ctx context.Context, dst io.Writer) error {
 // FrameCount returns the number of independently readable frames.
 func (r *Reader) FrameCount() int { return len(r.index.Frames) }
 
-// FrameDigests returns a copy of the ordered logical chunk mapping. The
-// mapping describes fixed-size frames, not a content-defined chunking scheme.
-func (r *Reader) FrameDigests() []digest.Digest {
-	digests := make([]digest.Digest, len(r.index.Frames))
-	for i, f := range r.index.Frames {
-		digests[i], _ = r.digest.GetDigestFunction().NewDigest(f.Hash, f.Size)
-	}
-	return digests
-}
-
 // ReadCompressedFrame returns one independent Zstandard frame after checking
 // its encoded checksum. It acquires no codec and shares no read cursor with
 // other calls, so callers may fetch frames in parallel with bounded workers.
@@ -401,6 +404,7 @@ func (r *Reader) ReadCompressedFrame(ctx context.Context, i int) ([]byte, error)
 	}
 	h := sha256.Sum256(data)
 	if hex.EncodeToString(h[:]) != f.EncodedHash {
+		compressionmetrics.Integrity("corrupt_frame")
 		return nil, ErrCorruptFrame
 	}
 	if err := checkContext(ctx); err != nil {
@@ -481,6 +485,7 @@ func (r *Reader) ReadFrameAt(ctx context.Context, offset int64, compressed bool,
 	g := r.digest.GetDigestFunction().NewGenerator(f.Size)
 	g.Write(data)
 	if int64(len(data)) != f.Size || g.Sum().GetHashString() != f.Hash {
+		compressionmetrics.Integrity("corrupt_frame")
 		return nil, offset, ErrCorruptFrame
 	}
 	if err := checkContext(ctx); err != nil {
@@ -491,23 +496,4 @@ func (r *Reader) ReadFrameAt(ctx context.Context, offset int64, compressed bool,
 		data, err = compressFrame(ctx, data, r.index.FrameSize, pool)
 	}
 	return data, next, err
-}
-
-// WriteIdentity decodes only frames overlapping the requested logical suffix.
-// Codec leases are released before writing to a potentially slow consumer.
-func (r *Reader) WriteIdentity(ctx context.Context, dst io.Writer, offset int64, pool zstd.Pool) error {
-	if offset < 0 || offset > r.digest.GetSizeBytes() || pool == nil {
-		return status.Error(codes.InvalidArgument, "Invalid logical offset or codec pool")
-	}
-	for offset < r.digest.GetSizeBytes() {
-		data, next, err := r.ReadFrameAt(ctx, offset, false, pool)
-		if err != nil {
-			return err
-		}
-		if err := writeAll(dst, data); err != nil {
-			return err
-		}
-		offset = next
-	}
-	return checkContext(ctx)
 }

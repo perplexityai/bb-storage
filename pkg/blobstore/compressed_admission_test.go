@@ -6,8 +6,10 @@ import (
 	"sync"
 	"syscall"
 	"testing"
+	"testing/synctest"
 	"time"
 
+	"github.com/prometheus/client_golang/prometheus"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -49,4 +51,36 @@ func TestStagingFilesystemErrorCodes(t *testing.T) {
 		require.Equal(t, codes.ResourceExhausted, status.Code(stagingError(errors.Join(errors.New("write"), err))))
 	}
 	require.Equal(t, codes.Internal, status.Code(stagingError(syscall.EIO)))
+}
+
+func TestStagingAdmissionDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		budget := &stagingBudget{changed: make(chan struct{})}
+		ctx, cancel := context.WithTimeout(t.Context(), time.Minute)
+		defer cancel()
+		before := stagingTimeouts(t)
+		start := time.Now()
+		require.Equal(t, codes.ResourceExhausted, status.Code(acquireUploadCapacity(ctx, budget, 1)))
+		require.Equal(t, 30*time.Second, time.Since(start))
+		require.Equal(t, before+1, stagingTimeouts(t))
+		require.NoError(t, ctx.Err(), "staging must enforce its own timeout")
+	})
+}
+
+func stagingTimeouts(t *testing.T) float64 {
+	t.Helper()
+	families, err := prometheus.DefaultGatherer.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() == "buildbarn_cas_compression_rejected_requests_total" {
+			for _, metric := range family.Metric {
+				for _, label := range metric.Label {
+					if label.GetName() == "reason" && label.GetValue() == "staging_timeout" {
+						return metric.Counter.GetValue()
+					}
+				}
+			}
+		}
+	}
+	return 0
 }

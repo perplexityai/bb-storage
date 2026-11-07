@@ -8,6 +8,7 @@ import (
 	remoteexecution "github.com/bazelbuild/remote-apis/build/bazel/remote/execution/v2"
 	"github.com/buildbarn/bb-storage/pkg/blobstore"
 	"github.com/buildbarn/bb-storage/pkg/blobstore/buffer"
+	"github.com/buildbarn/bb-storage/pkg/blobstore/compressionmetrics"
 	"github.com/buildbarn/bb-storage/pkg/digest"
 	bb_zstd "github.com/buildbarn/bb-storage/pkg/zstd"
 
@@ -81,6 +82,7 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 	case remoteexecution.Compressor_ZSTD:
 		b := s.blobAccess.Get(ctx, digest)
 		if r, ok := buffer.ZSTDChunkReaderAt(b, in.ReadOffset, s.readChunkSize); ok {
+			compressionmetrics.Transfer("read", true)
 			defer r.Close()
 			for {
 				p, err := r.Read()
@@ -95,6 +97,7 @@ func (s *byteStreamServer) Read(in *bytestream.ReadRequest, out bytestream.ByteS
 				}
 			}
 		}
+		compressionmetrics.Transfer("read", false)
 		r := buffer.NewReaderFromChunkReader(b.ToChunkReader(in.ReadOffset, s.readChunkSize))
 		defer r.Close()
 		return bb_zstd.CopySized(ctx, s.zstdPool, &readStreamWriter{out: out}, r, digest.GetSizeBytes()-in.ReadOffset)

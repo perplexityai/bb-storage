@@ -46,7 +46,7 @@ func TestCopyReleasesEncoderBeforeFurtherReads(t *testing.T) {
 	data := bytes.Repeat([]byte("multiple independent frames"), 100000)
 	source := &retryingCodecReader{ctx: ctx, pool: pool, data: bytes.NewReader(data)}
 	var compressed bytes.Buffer
-	require.NoError(t, bb_zstd.Copy(ctx, pool, &compressed, source))
+	require.NoError(t, bb_zstd.CopySized(ctx, pool, &compressed, source, 1<<20))
 	require.Greater(t, source.reads, 2)
 	decoder, err := zstd.NewReader(nil)
 	require.NoError(t, err)
@@ -55,7 +55,7 @@ func TestCopyReleasesEncoderBeforeFurtherReads(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, data, actual)
 	compressed.Reset()
-	require.NoError(t, bb_zstd.Copy(ctx, pool, &compressed, bytes.NewReader(nil)))
+	require.NoError(t, bb_zstd.CopySized(ctx, pool, &compressed, bytes.NewReader(nil), 0))
 	actual, err = decoder.DecodeAll(compressed.Bytes(), nil)
 	require.NoError(t, err)
 	require.Empty(t, actual)
@@ -68,7 +68,7 @@ func TestCopyPreservesFullFrameSourceError(t *testing.T) {
 	failure := errors.New("source failed with final bytes")
 	var out bytes.Buffer
 	// No encoder is needed: invalid input must not reach it.
-	require.ErrorIs(t, bb_zstd.Copy(t.Context(), nil, &out, finalErrorReader{failure}), failure)
+	require.ErrorIs(t, bb_zstd.CopySized(t.Context(), nil, &out, finalErrorReader{failure}, 1<<20), failure)
 	require.Empty(t, out.Bytes())
 }
 

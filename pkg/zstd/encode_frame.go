@@ -6,6 +6,8 @@ import (
 	"io"
 )
 
+const emptyFrame = "\x28\xb5\x2f\xfd\x20\x00\x01\x00\x00"
+
 // EncodeFrame releases the encoder before returning bytes to a potentially
 // slow destination. Built-in encoders use known-size encoding while respecting
 // configured window limits. Custom streaming
@@ -15,7 +17,7 @@ func EncodeFrame(ctx context.Context, pool Pool, data []byte) (encoded []byte, e
 		return nil, err
 	}
 	if len(data) == 0 {
-		return []byte{0x28, 0xb5, 0x2f, 0xfd, 0x20, 0x00, 0x01, 0x00, 0x00}, nil
+		return []byte(emptyFrame), nil
 	}
 	var output bytes.Buffer
 	encoder, err := pool.NewEncoder(ctx, &output)
